@@ -558,6 +558,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(run_manifest_test PRIVATE include)
   add_test(NAME run_manifest_test COMMAND run_manifest_test)
 
+  # ChordMoE: window union set-cover router, mid-window dead-suffix offload elision, min-max hetero scheduler, and ggml adapter (header-only, no GPU)
+  add_executable(chordmoe_test tests/core/chordmoe_test.cpp)
+  target_include_directories(chordmoe_test PRIVATE include contrib/llama_cpp_chordmoe)
+  target_link_libraries(chordmoe_test PRIVATE Threads::Threads)
+  add_test(NAME chordmoe_test COMMAND chordmoe_test)
+
   # the Windows HIP auto prefill chunk cap (#1630) and the commit-limit verdict (#1607): header-only, no GPU
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
   target_include_directories(host_limits_test PRIVATE include)

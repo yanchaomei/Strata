@@ -23,6 +23,7 @@
 
 #include <cstdio>
 
+#include "strata/chordmoe/chord_abort.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/flag_order.hpp"
 #include "strata/core/layer.hpp"
@@ -100,6 +101,13 @@ public:
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
+    /// ChordMoE (opt-in): optional helper-GPU union residency table (`[n_layers * n_expert]` on this device)
+    /// and lock-free mid-window dead-suffix offload elision controller (`STRATA_CHORD_EARLY_ABORT=1`).
+    void set_chord_peer_res(const int32_t* d_peer_res) { d_chord_peer_res_ = d_peer_res; }
+    int32_t chord_cap_prefix(int32_t valid_rows, int32_t at_layer) {
+        return chord_abort_.cap_live_prefix(valid_rows, at_layer);
+    }
+    strata::chordmoe::ChordAbortController& chord_abort_controller() { return chord_abort_; }
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -635,6 +643,9 @@ private:
     bool rs_on_ = false;                      // STRATA_ROUTE_STATS
     unsigned long long* rs_dev_ = nullptr;    // [9 T][n_layers][8 rows]: experts of row r that no earlier row of the window routed to
     int64_t rs_win_[strata::kernels::kVerifyLongT + 1] = {};
+    const int32_t* d_chord_peer_res_ = nullptr;
+    unsigned long long* chord_stats_ = nullptr;
+    strata::chordmoe::ChordAbortController chord_abort_;
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

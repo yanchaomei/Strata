@@ -31,6 +31,8 @@ engine refuses or fails to start (serve/server.py, "split_fallback").
 from __future__ import annotations
 
 import dataclasses
+import math
+import os
 import pathlib
 import re
 
@@ -131,6 +133,7 @@ class Decision:
     quiet: bool = False             # auto mode and a "no": the launch says nothing and starts the normal layer split
     arch: str = ""                  # the cards' architecture ("sm_86", "gfx1201"); empty when no card was probed (the run manifest records it)
     routed_types: tuple = ()        # the model's routed-expert types, sorted (the run manifest records them)
+    offload_ram_gib: int = 0        # ChordMoE (STRATA_CHORD_SPLIT_OFFLOAD=1): GiB of coldest routed experts kept in host RAM (FNX_EXPERT_RAM_GIB)
 
     @property
     def line(self) -> str:
@@ -189,10 +192,14 @@ def scan_model(first_shard: str | pathlib.Path) -> ModelFacts:
 
 
 def decide(*, enabled: bool, system: str, cards: list[Card], ram_total_gib: float, ram_available_gib: float, model: ModelFacts,
-           context: int = TESTED_CONTEXT, allow_untested: bool = False, cache_mib: int = CONVERSATION_CACHE_MIB) -> Decision:
+           context: int = TESTED_CONTEXT, allow_untested: bool = False, cache_mib: int = CONVERSATION_CACHE_MIB,
+           chord_offload: bool | None = None) -> Decision:
     """Whether the all-cards split engine runs this launch, with plain reasons when not."""
     if not enabled:
         return Decision(False, ["the all-cards split engine is off (it is opt-in)"])
+    if chord_offload is None:
+        chord_offload = os.environ.get("STRATA_CHORD_SPLIT_OFFLOAD", "").strip() == "1"
+    eff_allow_untested = allow_untested or chord_offload
     why: list[str] = []
     untested: list[str] = []
     if system != "linux":
@@ -216,19 +223,19 @@ def decide(*, enabled: bool, system: str, cards: list[Card], ram_total_gib: floa
     archs = sorted({c.arch_name for c in cards})
     counts = sorted({k for a in archs for k in tested.get(a, ())})
     if 2 <= n <= MAX_CARDS and make in TESTED and n not in counts and not (len(archs) == 1 and archs[0] not in tested):
-        if allow_untested:
+        if eff_allow_untested:
             untested.append(f"{n} cards")
         else:
             ran = " and ".join(str(k) for k in counts) if counts else "no number of"
             why.append(f"it has only been run on {ran} cards, not {n}")
     if cards and not all(c.arch_name in tested for c in cards):
-        if allow_untested:
+        if eff_allow_untested:
             untested.append(f"card architecture {cards[0].arch_name}")
         else:
             ran = "/".join(tested) if tested else "no"
             why.append(f"it has only been run on {ran} cards, not {cards[0].arch_name}")
     if context > TESTED_CONTEXT:
-        if allow_untested:
+        if eff_allow_untested:
             untested.append(f"context {context}")
         else:
             why.append(f"it has only been run up to a context of {TESTED_CONTEXT}")
@@ -252,12 +259,21 @@ def decide(*, enabled: bool, system: str, cards: list[Card], ram_total_gib: floa
         why.append("it only knows Qwen3.8-Flash-Next (48 layers, 512 experts)")
     need_vram = model.routed_bytes / GIB / max(n, 1) + CARD_OVERHEAD_GIB
     need_ram = model.embd_ram_bytes / GIB + RAM_PINNED_BUFFERS_GIB + cache_mib / 1024
-    if cards and n >= 2 and min(c.room_mib for c in cards) / 1024 < need_vram:
-        has = f"{min(c.room_mib for c in cards) / 1024:.0f} GiB" + (" free" if any(c.free_mib is not None for c in cards) else "")   # free memory when it was read, else the size
-        why.append(f"all the experts do not fit in the cards' memory (each card needs about {need_vram:.0f} GiB, has {has})")
+    offload_ram_gib = 0
+    if cards and n >= 2:
+        min_room_gib = min(c.room_mib for c in cards) / 1024
+        if min_room_gib < need_vram:
+            if chord_offload and min_room_gib >= CARD_OVERHEAD_GIB + 2.0:
+                vram_for_experts = n * max(0.0, min_room_gib - CARD_OVERHEAD_GIB)
+                offload_ram_gib = max(1, math.ceil(model.routed_bytes / GIB - vram_for_experts))
+                need_ram += offload_ram_gib
+                untested.append(f"chordmoe host offload ({offload_ram_gib} GiB in RAM)")
+            else:
+                has = f"{min_room_gib:.0f} GiB" + (" free" if any(c.free_mib is not None for c in cards) else "")
+                why.append(f"all the experts do not fit in the cards' memory (each card needs about {need_vram:.0f} GiB, has {has})")
     if ram_available_gib < need_ram + RAM_SPARE_GIB:
         why.append(f"there is not enough free RAM (about {need_ram + RAM_SPARE_GIB:.0f} GiB needed, {ram_available_gib:.0f} GiB free)")
-    facts = dict(arch="/".join(archs), routed_types=tuple(sorted(model.routed_types)))
+    facts = dict(arch="/".join(archs), routed_types=tuple(sorted(model.routed_types)), offload_ram_gib=offload_ram_gib)
     if why:
         return Decision(False, why, n, untested, need_vram, need_ram, **facts)
     return Decision(True, [], n, untested, need_vram, need_ram, **facts)
@@ -278,8 +294,9 @@ def split_config(base: dict, decision: Decision, *, exe: str, native: str, mtp_d
                    "--spec", "6", "--lookup", "15", "--conversation-cache-mib", str(cache_mib), "--batch", str(min(MAX_LANES, max(lanes, 1)))]
     if vision:
         cfg["args"].append("--vision")
-    # every expert in the cards' memory, no expert cache, no arena: the engine reads these two at start
-    cfg["env"] = {**(base.get("env") or {}), "FNX_ARENA": "0", "FNX_EXPERT_RAM_GIB": "off"}
+    # every expert in the cards' memory by default; with ChordMoE split offload, coldest `offload_ram_gib` GiB stay in mapped host RAM
+    expert_ram_env = str(decision.offload_ram_gib) if decision.offload_ram_gib > 0 else "off"
+    cfg["env"] = {**(base.get("env") or {}), "FNX_ARENA": "0", "FNX_EXPERT_RAM_GIB": expert_ram_env}
     cfg["split_fallback"] = {k: base[k] for k in ("exe", "args", "env", "layer_split", "replicas", "user_args", "drafting", "cwd") if k in base}
     # The split engine runs the model's own draft layer (the MTP) and nothing else. Saying so in the config ("drafting": "mtp") keeps serve/server.py's
     # drafter step, which resolves Auto to DFlash2 where the engine has it, from adding DFlash2 flags to the split engine's arguments (it would refuse them

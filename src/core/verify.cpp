@@ -35,6 +35,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/chord_router_cuda.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -174,6 +175,10 @@ RouteResidentCfg& route_resident_cfg() {
     }();
     (void) parsed;
     return c;
+}
+inline const strata::chordmoe::ChordConfig& chord_cfg() {
+    static const strata::chordmoe::ChordConfig cfg = strata::chordmoe::ChordConfig::from_env();
+    return cfg;
 }
 inline bool g_lfuse_gate() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_GATE"); return v == nullptr || v[0] != '0'; }(); return on; }
 inline bool g_lfuse_pair() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_PAIR"); return v == nullptr || v[0] != '0'; }(); return on; }
@@ -2253,6 +2258,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
+#if !defined(STRATA_GPU_METAL)
+        if (chord_cfg().mode == strata::chordmoe::ChordMode::BoundedSetCover && hits_.d_res != nullptr &&
+            strata::kernels::chord_router_supported((int) NE, (int) K)) {
+            const int32_t* peer_layer_res = d_chord_peer_res_ != nullptr ? (d_chord_peer_res_ + l * g.n_expert) : nullptr;
+            try {
+                strata::kernels::chord_route_window(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K,
+                                                    hits_.d_res + l * g.n_expert, peer_layer_res,
+                                                    n, (int) NE, (int) K, chord_cfg(), chord_stats_, cs);
+            } catch (const std::exception& e) { err = "verify chord-router: " + std::string(e.what()); return false; }
+        }
+#endif
         if (rs_on_ && G == 1 && n <= 16 && T <= 16)
             strata::kernels::route_marginal_stats(ids_ + tb * K, n, (int) K, rs_dev_ + ((size_t) T * (size_t) g.n_layers + (size_t) l) * 16, cs);
         if (ar_on()) {
@@ -3279,6 +3295,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
+    if (chord_cfg().early_abort) chord_abort_.begin_window(T, g.n_embd);
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
     // the overlapped split launched this stage's window already: keep the graph variant (#871) chosen for it then,
     // or this thread would serve the window as the other variant
@@ -3503,9 +3520,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
-        if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        if (pool != nullptr) {
+            if (chord_cfg().early_abort) {
+                chord_abort_.dispatch_subwindow(pool, user, tb, h_x_ + (size_t) tb * g.n_embd,
+                                                h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                                                h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+            } else {
+                pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                     h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+            }
+        }
         if (remote_opt_) remote_opt_->end();
         VDBG("layer %lld served\n", (long long) l);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
@@ -5277,6 +5301,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     fl_T_ = T;
     fl_k_ = 0;
     fl_total_ = (le_ - lb_) * G;
+    if (chord_cfg().early_abort) chord_abort_.begin_window(T, g_->n_embd);
     fl_prof_ = prof_on_ && G == 1 && prof_pin_ != nullptr;
     if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -5360,9 +5385,16 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window (pipelined): the CPU experts of layer", l);
-        if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        if (pool != nullptr) {
+            if (chord_cfg().early_abort) {
+                chord_abort_.dispatch_subwindow(pool, user, tb, h_x_ + (size_t) tb * g.n_embd,
+                                                h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                                                h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+            } else {
+                pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                     h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+            }
+        }
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", fl_k_, l,
                               (int64_t) ms_since(b));
         progress_tick();
