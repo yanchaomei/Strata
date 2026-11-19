@@ -51,6 +51,11 @@ struct ChordConfig {
     int32_t   rank_hi          = 31;     ///< Last Top-K rank eligible (clamped to k - 1).
     bool      protect_anchor   = true;   ///< Never alter token t = 0 (the verified/accepted anchor token).
     bool      early_abort      = false;  ///< Enable graph-preserving mid-window dead-suffix offload elision (`STRATA_CHORD_EARLY_ABORT=1`).
+    bool      online_probe     = false;  ///< Enable zero-GPU-cost doorbell online divergence probe (`STRATA_CHORD_ONLINE_PROBE=1`).
+    int32_t   probe_warmup     = 6;      ///< Minimum layer index before the online divergence probe may cap the suffix.
+    int32_t   probe_patience   = 3;      ///< Consecutive divergent layers required before capping `live_rows` at draft `t`.
+    float     probe_jaccard_min = 0.20f; ///< Trajectory Top-K Jaccard floor when draft expert predictions are provided.
+    float     probe_entropy_ratio = 1.65f; ///< Draft-vs-anchor normalized router entropy spike ratio triggering streak increment.
     bool      split_offload    = false;  ///< Allow all-cards + multi-NUMA heterogeneous offload scheduling (`STRATA_CHORD_SPLIT_OFFLOAD=1`).
 
     static ChordConfig from_env() {
@@ -83,6 +88,12 @@ struct ChordConfig {
         }
         if (const char* v = std::getenv("STRATA_CHORD_EARLY_ABORT")) {
             if (v[0] != '\0') cfg.early_abort = (std::atoi(v) != 0);
+        }
+        if (const char* v = std::getenv("STRATA_CHORD_ONLINE_PROBE")) {
+            if (v[0] != '\0') {
+                cfg.online_probe = (std::atoi(v) != 0);
+                if (cfg.online_probe) cfg.early_abort = true;
+            }
         }
         if (const char* v = std::getenv("STRATA_CHORD_SPLIT_OFFLOAD")) {
             if (v[0] != '\0') cfg.split_offload = (std::atoi(v) != 0);

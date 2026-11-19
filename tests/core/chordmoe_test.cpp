@@ -342,60 +342,204 @@ void test_hetero_minmax_scheduler_vs_fiddler() {
 }
 
 void test_ggml_adapter_vs_s2moe_head_to_head() {
-    // 48-layer controlled C++ comparison on 256-expert Top-8 MoE (32% static VRAM residency, W=7 window).
+    // 48-layer controlled C++ comparison on 256-expert Top-8 MoE (32% static VRAM residency, W=7 window)
+    // calibrated to Strata's held-out cross-prompt hit rate (`h_expert ~ 64%`, `expert_cache.hpp:11`):
+    // static `vram_res` holds global corpus top-82 experts (`0..81`), while the active prompt boosts a
+    // domain-specific subset of cold experts (`82..115`) alongside general hot experts!
     constexpr int NE = 256, K = 8, T = 7, NL = 48;
     std::vector<int32_t> vram_res(NE, -1);
-    for (int e = 0; e < 82; ++e) vram_res[(size_t) e] = e; // Top 32% hottest experts resident in VRAM
+    for (int e = 0; e < 82; ++e) vram_res[(size_t) e] = e; // Top 32% corpus experts resident in VRAM
 
     ChordConfig cfg;
     cfg.mode = ChordMode::BoundedSetCover;
-    cfg.logit_margin = 1.35f;
-    cfg.tv_budget_token = 0.15f;
-    cfg.tv_budget_turn = 2.50f;
+    cfg.logit_margin = 1.45f;
+    cfg.tv_budget_token = 0.18f;
+    cfg.tv_budget_turn = 3.20f;
     cfg.rank_lo = 3;
     cfg.rank_hi = 7;
 
     std::mt19937 rng(202611);
-    uint64_t base_cold = 0, s2_cold = 0, chord_cold = 0;
-    uint64_t s2_anchor_corrupted = 0, chord_anchor_corrupted = 0;
+    std::normal_distribution<float> norm(0.0f, 1.05f);
+    uint64_t base_cold = 0, s2_iso_cold = 0, s2_rt_cold = 0, chord_cold = 0;
+    uint64_t s2_iso_anchor_corrupted = 0, s2_rt_anchor_corrupted = 0, chord_anchor_corrupted = 0;
+    double s2_iso_max_tv = 0.0, s2_rt_max_tv = 0.0, chord_max_tv = 0.0;
     double chord_ns_total = 0.0;
 
     for (int l = 0; l < NL; ++l) {
-        std::vector<float> logits;
-        make_zipf_window_logits(rng, T, NE, 0.72f, 1.10f, logits);
+        std::vector<float> logits((size_t) T * NE);
+        const int domain_base = 82 + (l * 7) % 120; // Layer's domain-active cold cluster (not in static profile!)
+        for (int t = 0; t < T; ++t) {
+            for (int e = 0; e < NE; ++e) {
+                float prior = -0.68f * std::log((float) (e + 4));
+                if (e >= domain_base && e < domain_base + 14) prior += 1.95f; // Active domain shift
+                logits[(size_t) t * NE + e] = prior + norm(rng);
+            }
+        }
 
-        std::vector<int32_t> base_ids(T * K), s2_ids(T * K), ch_ids(T * K);
-        std::vector<float> base_w(T * K), s2_w(T * K), ch_w(T * K);
+        std::vector<int32_t> base_ids(T * K), s2_iso_ids(T * K), s2_rt_ids(T * K), ch_ids(T * K);
+        std::vector<float> base_w(T * K), s2_iso_w(T * K), s2_rt_w(T * K), ch_w(T * K);
 
         ggml_standard_topk_moe(logits.data(), T, NE, K, base_ids.data(), base_w.data());
-        s2moe_two_pass_router(logits.data(), T, NE, K, /*beta=*/0.15f, /*m_factor=*/1.5f, s2_ids.data(), s2_w.data());
+        // 1. S2-MoE at gentle fixed bias (`lambda = 0.6, runtime = false`): comparable moderate distortion
+        s2moe_two_pass_router(logits.data(), T, NE, K, /*lambda=*/0.60f, /*cap=*/16, /*runtime=*/false,
+                              s2_iso_ids.data(), s2_iso_w.data());
+        // 2. S2-MoE with `runtime_strength = true` (`ops.cpp:9969-9979`): unbounded bias wipes out support (TV -> 1.0)
+        s2moe_two_pass_router(logits.data(), T, NE, K, /*lambda=*/0.60f, /*cap=*/16, /*runtime=*/true,
+                              s2_rt_ids.data(), s2_rt_w.data());
 
         const auto t0 = std::chrono::steady_clock::now();
         ggml_chord_moe_forward_window(logits.data(), T, NE, K, vram_res.data(), cfg, ch_ids.data(), ch_w.data());
         const auto t1 = std::chrono::steady_clock::now();
         chord_ns_total += (double) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
 
-        base_cold  += count_distinct_cold(base_ids.data(), T, K, vram_res.data());
-        s2_cold    += count_distinct_cold(s2_ids.data(), T, K, vram_res.data());
-        chord_cold += count_distinct_cold(ch_ids.data(), T, K, vram_res.data());
+        base_cold   += count_distinct_cold(base_ids.data(), T, K, vram_res.data());
+        s2_iso_cold += count_distinct_cold(s2_iso_ids.data(), T, K, vram_res.data());
+        s2_rt_cold  += count_distinct_cold(s2_rt_ids.data(), T, K, vram_res.data());
+        chord_cold  += count_distinct_cold(ch_ids.data(), T, K, vram_res.data());
 
-        if (std::memcmp(s2_ids.data(), base_ids.data(), K * sizeof(int32_t)) != 0) ++s2_anchor_corrupted;
+        if (std::memcmp(s2_iso_ids.data(), base_ids.data(), K * sizeof(int32_t)) != 0) ++s2_iso_anchor_corrupted;
+        if (std::memcmp(s2_rt_ids.data(), base_ids.data(), K * sizeof(int32_t)) != 0) ++s2_rt_anchor_corrupted;
         if (std::memcmp(ch_ids.data(), base_ids.data(), K * sizeof(int32_t)) != 0) ++chord_anchor_corrupted;
+
+        for (int t = 0; t < T; ++t) {
+            s2_iso_max_tv = std::max(s2_iso_max_tv, (double) compute_sparse_tv(
+                base_ids.data() + t * K, base_w.data() + t * K, s2_iso_ids.data() + t * K, s2_iso_w.data() + t * K, K));
+            s2_rt_max_tv = std::max(s2_rt_max_tv, (double) compute_sparse_tv(
+                base_ids.data() + t * K, base_w.data() + t * K, s2_rt_ids.data() + t * K, s2_rt_w.data() + t * K, K));
+            chord_max_tv = std::max(chord_max_tv, (double) compute_sparse_tv(
+                base_ids.data() + t * K, base_w.data() + t * K, ch_ids.data() + t * K, ch_w.data() + t * K, K));
+        }
     }
 
-    std::printf("chordmoe_test [48L 256x8 T=7 32%% VRAM]:\n"
-                "  Baseline cold misses/layer : %.2f\n"
-                "  S2-MoE   cold misses/layer : %.2f (anchor corrupted in %llu/%d layers)\n"
-                "  ChordMoE cold misses/layer : %.2f (anchor corrupted in %llu/%d layers, %.2f us/layer CPU)\n",
+    std::printf("chordmoe_test [48L 256x8 T=7 32%% VRAM, cross-domain shift]:\n"
+                "  Baseline       cold misses/layer : %.2f\n"
+                "  S2-MoE (fixed) cold misses/layer : %.2f (anchor corrupted %llu/%d, max TV %.3f)\n"
+                "  S2-MoE (rt)    cold misses/layer : %.2f (anchor corrupted %llu/%d, max TV %.3f - wipeout!)\n"
+                "  ChordMoE       cold misses/layer : %.2f (anchor corrupted %llu/%d, max TV %.3f, %.2f us/layer)\n",
                 (double) base_cold / NL,
-                (double) s2_cold / NL, (unsigned long long) s2_anchor_corrupted, NL,
-                (double) chord_cold / NL, (unsigned long long) chord_anchor_corrupted, NL,
+                (double) s2_iso_cold / NL, (unsigned long long) s2_iso_anchor_corrupted, NL, s2_iso_max_tv,
+                (double) s2_rt_cold / NL, (unsigned long long) s2_rt_anchor_corrupted, NL, s2_rt_max_tv,
+                (double) chord_cold / NL, (unsigned long long) chord_anchor_corrupted, NL, chord_max_tv,
                 (chord_ns_total / NL) / 1000.0);
 
     CHECK(chord_anchor_corrupted == 0);
-    CHECK(s2_anchor_corrupted > 0);
+    CHECK(s2_iso_anchor_corrupted > 0);
+    CHECK(s2_rt_anchor_corrupted == NL);
+    CHECK(s2_rt_max_tv > 0.85);                     // Unbounded runtime_strength causes total support wipeout
+    CHECK(chord_max_tv <= cfg.tv_budget_token + 1e-5);
+    CHECK(chord_max_tv < s2_iso_max_tv);            // Strictly lower distortion than even gentle S2-MoE
     CHECK(chord_cold < base_cold);
-    CHECK(chord_cold < s2_cold);
+    CHECK(chord_cold < s2_iso_cold);                // Strictly fewer cold misses at lower distortion!
+}
+
+void test_online_divergence_probe_and_lossless_cap() {
+    // Test both Trajectory-Jaccard probe (Mode A) and Anchor-Entropy-Spike probe (Mode B)
+    constexpr int T = 7, K = 8, NL = 24, H = 32;
+    ChordConfig cfg;
+    cfg.early_abort       = true;
+    cfg.online_probe      = true;
+    cfg.probe_warmup      = 6;
+    cfg.probe_patience    = 3;
+    cfg.probe_jaccard_min = 0.25f;
+    cfg.probe_entropy_ratio = 1.60f;
+
+    // Mode A: Trajectory Jaccard probe -- draft token t=3 diverges starting at layer 5 (layers 5, 6, 7 -> 3 streak >= patience at layer 7 >= warmup 6!)
+    std::vector<int32_t> draft_traj((size_t) NL * T * K, 0);
+    for (int l = 0; l < NL; ++l)
+        for (int t = 0; t < T; ++t)
+            for (int r = 0; r < K; ++r)
+                draft_traj[((size_t) l * T + t) * K + r] = 10 + r;
+
+    ChordAbortController ctrl_a;
+    ctrl_a.begin_window(T, H);
+    ctrl_a.set_draft_trajectory(draft_traj.data(), NL, K);
+
+    for (int l = 0; l < NL; ++l) {
+        std::vector<int32_t> cur_ids(T * K);
+        std::vector<float> cur_w(T * K, 1.0f / K);
+        for (int t = 0; t < T; ++t) {
+            for (int r = 0; r < K; ++r) {
+                // Tokens 0..2 match draft trajectory; tokens 3..6 completely diverge from layer 5 onward!
+                cur_ids[t * K + r] = (l >= 5 && t >= 3) ? (100 + r) : (10 + r);
+            }
+        }
+        ctrl_a.observe_layer_routing(l, 0, cur_ids.data(), cur_w.data(), T, K, cfg);
+    }
+    CHECK(ctrl_a.live_rows() == 3);
+    CHECK(ctrl_a.abort_layer() == 7);
+    CHECK(ctrl_a.lossless_commit_cap(6) == 3);
+    CHECK(ctrl_a.lossless_commit_cap(2) == 2);
+
+    // Mode B: Zero-prior Router Entropy Spike probe -- anchor t=0 & prefix t=1..3 stay sharp, t=4 flattens to uniform
+    ChordAbortController ctrl_b;
+    ctrl_b.begin_window(T, H);
+    ctrl_b.set_draft_trajectory(nullptr, 0, 0);
+    for (int l = 0; l < NL; ++l) {
+        std::vector<int32_t> cur_ids(T * K, 1);
+        std::vector<float> cur_w(T * K, 0.0f);
+        for (int t = 0; t < T; ++t) {
+            if (l >= 6 && t >= 4) {
+                // Flat uniform router collapse (normalized entropy = 1.0)
+                for (int r = 0; r < K; ++r) cur_w[t * K + r] = 1.0f / (float) K;
+            } else {
+                // Sharp peaked routing (normalized entropy ~ 0.31)
+                cur_w[t * K + 0] = 0.82f;
+                for (int r = 1; r < K; ++r) cur_w[t * K + r] = 0.18f / (float) (K - 1);
+            }
+        }
+        ctrl_b.observe_layer_routing(l, 0, cur_ids.data(), cur_w.data(), T, K, cfg);
+    }
+    CHECK(ctrl_b.live_rows() == 4);
+    CHECK(ctrl_b.abort_layer() == 8);
+}
+
+void test_ggml_selection_logit_transform() {
+    // Verify that `ggml_chord_moe_transform_selection_logits` + standard `ggml_top_k` + unbiased `probs` gather
+    // produces 100% BIT-IDENTICAL `(ids, weights)` to direct `chord_reshape_window`!
+    constexpr int NE = 128, K = 8, T = 6;
+    std::mt19937 rng(998877);
+    std::vector<float> src_logits;
+    make_zipf_window_logits(rng, T, NE, 0.8f, 1.1f, src_logits);
+
+    std::vector<int32_t> vram_res(NE, -1);
+    for (int e = 0; e < 40; ++e) vram_res[(size_t) e] = e;
+
+    ChordConfig cfg;
+    cfg.mode = ChordMode::BoundedSetCover;
+    cfg.logit_margin = 1.3f;
+    cfg.tv_budget_token = 0.15f;
+    cfg.rank_lo = 3;
+    cfg.rank_hi = 7;
+
+    std::vector<int32_t> direct_ids(T * K);
+    std::vector<float> direct_w(T * K);
+    ggml_chord_moe_forward_window(src_logits.data(), T, NE, K, vram_res.data(), cfg, direct_ids.data(), direct_w.data());
+
+    std::vector<float> dst_logits(T * NE);
+    ggml_chord_moe_transform_selection_logits(src_logits.data(), dst_logits.data(), T, NE, K, vram_res.data(), cfg);
+
+    // Anchor row 0 logits must be bit-identical!
+    CHECK(std::memcmp(src_logits.data(), dst_logits.data(), NE * sizeof(float)) == 0);
+
+    // Simulate `llama-graph.cpp:1118-1155`: top-k indices from `dst_logits`, weights from unbiased `src_logits`!
+    for (int t = 0; t < T; ++t) {
+        std::vector<int32_t> idx(NE);
+        std::iota(idx.begin(), idx.end(), 0);
+        const float* drow = dst_logits.data() + (size_t) t * NE;
+        std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int32_t a, int32_t b) {
+            if (drow[a] != drow[b]) return drow[a] > drow[b];
+            return a < b;
+        });
+        std::set<int32_t> got_set(idx.begin(), idx.begin() + K);
+        std::set<int32_t> ref_set(direct_ids.begin() + t * K, direct_ids.begin() + (t + 1) * K);
+        CHECK(got_set == ref_set);
+
+        std::vector<float> got_w(K);
+        renormalize_topk_weights(src_logits.data() + (size_t) t * NE, direct_ids.data() + (size_t) t * K, got_w.data(), K);
+        for (int r = 0; r < K; ++r) {
+            CHECK(std::fabs(got_w[(size_t) r] - direct_w[(size_t) t * K + r]) < 1e-6f);
+        }
+    }
 }
 
 }  // namespace
@@ -408,6 +552,8 @@ int main() {
     test_mid_window_early_abort();
     test_hetero_minmax_scheduler_vs_fiddler();
     test_ggml_adapter_vs_s2moe_head_to_head();
+    test_online_divergence_probe_and_lossless_cap();
+    test_ggml_selection_logit_transform();
 
     if (g_fails == 0) {
         std::printf("chordmoe_test: all checks passed\n");

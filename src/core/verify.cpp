@@ -3522,6 +3522,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (pool != nullptr) {
             if (chord_cfg().early_abort) {
+                if (chord_cfg().online_probe) {
+                    chord_abort_.observe_layer_routing(l, tb, h_ids_ + (size_t) tb * ss.k,
+                                                       h_w_ + (size_t) tb * ss.k, n, ss.k, chord_cfg());
+                }
                 chord_abort_.dispatch_subwindow(pool, user, tb, h_x_ + (size_t) tb * g.n_embd,
                                                 h_ids_ + (size_t) tb * ss.k, n, ss.k,
                                                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -3910,6 +3914,7 @@ namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
 bool Verifier::commit(int n_keep, std::string& err) {
+    if (chord_cfg().early_abort) n_keep = chord_abort_.lossless_commit_cap(n_keep);
 #if defined(STRATA_GPU_METAL)
     return strata::metal_engine::window_commit(metal_, n_keep, err);
 #endif
@@ -5387,6 +5392,10 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         progress_at("verify window (pipelined): the CPU experts of layer", l);
         if (pool != nullptr) {
             if (chord_cfg().early_abort) {
+                if (chord_cfg().online_probe) {
+                    chord_abort_.observe_layer_routing(l, tb, h_ids_ + (size_t) tb * ss.k,
+                                                       h_w_ + (size_t) tb * ss.k, n, ss.k, chord_cfg());
+                }
                 chord_abort_.dispatch_subwindow(pool, user, tb, h_x_ + (size_t) tb * g.n_embd,
                                                 h_ids_ + (size_t) tb * ss.k, n, ss.k,
                                                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);

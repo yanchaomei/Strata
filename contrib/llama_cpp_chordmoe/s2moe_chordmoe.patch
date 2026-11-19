@@ -1,0 +1,104 @@
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 3ba3345..825dc33 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12,6 +12,10 @@
+ #include <numeric>
+ #include <cmath>
+ #include <cstring>
++#if __has_include("ggml_chord_moe.hpp")
++#include "ggml_chord_moe.hpp"
++#define GGML_HAVE_CHORDMOE 1
++#endif
+ 
+ static bool ggml_moe_debug_enabled() {
+     static int cached = -1;
+@@ -9984,6 +9988,13 @@ void ggml_compute_forward_moe_reuse_two_pass(
+         return;
+     }
+ 
++#if defined(GGML_HAVE_CHORDMOE)
++    if (strata::chordmoe::ggml_adapter::ggml_chord_moe_runtime_intercept(
++            (const float *) src0->data, (float *) dst->data, (int) ne1, (int) ne0, top_k)) {
++        return;
++    }
++#endif
++
+     std::vector<float> w_raw(ne1, 0.0f);
+     float max_w_raw = 0.0f;
+ 
+@@ -10048,6 +10059,10 @@ void ggml_compute_forward_moe_reuse_two_pass(
+             dst_row[e] = src_row[e] + bias[e];
+         }
+     }
++#if defined(GGML_HAVE_CHORDMOE)
++    strata::chordmoe::ggml_adapter::ggml_s2moe_audit_observe(
++        (const float *) src0->data, (const float *) dst->data, (int) ne1, (int) ne0, top_k);
++#endif
+ }
+ 
+ // ggml_compute_forward_map_custom1
+diff --git a/ggml/src/ggml-cuda/moe-reuse.cu b/ggml/src/ggml-cuda/moe-reuse.cu
+index 903112a..562d843 100644
+--- a/ggml/src/ggml-cuda/moe-reuse.cu
++++ b/ggml/src/ggml-cuda/moe-reuse.cu
+@@ -2,6 +2,11 @@
+ 
+ #include "ggml-cuda/common.cuh"
+ #include "ggml-impl.h"
++#include <vector>
++#if __has_include("ggml_chord_moe.hpp")
++#include "ggml_chord_moe.hpp"
++#define GGML_HAVE_CHORDMOE 1
++#endif
+ 
+ static __global__ void moe_reuse_importance_kernel(
+         const float * logits,
+@@ -193,6 +198,27 @@ void ggml_cuda_op_moe_reuse_two_pass(ggml_backend_cuda_context & ctx, ggml_tenso
+         return;
+     }
+ 
++#if defined(GGML_HAVE_CHORDMOE)
++    {
++        static const bool chord_on = [] {
++            const char * v = std::getenv("CHORDMOE_ENABLE");
++            return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
++        }();
++        if (chord_on) {
++            std::vector<float> h_in((size_t) n_experts * (size_t) n_tokens);
++            std::vector<float> h_out((size_t) n_experts * (size_t) n_tokens);
++            CUDA_CHECK(cudaMemcpyAsync(h_in.data(), logits_d, h_in.size() * sizeof(float),
++                                       cudaMemcpyDeviceToHost, ctx.stream()));
++            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++            strata::chordmoe::ggml_adapter::ggml_chord_moe_runtime_intercept(
++                h_in.data(), h_out.data(), (int) n_tokens, (int) n_experts, top_k);
++            CUDA_CHECK(cudaMemcpyAsync(out_d, h_out.data(), h_out.size() * sizeof(float),
++                                       cudaMemcpyHostToDevice, ctx.stream()));
++            return;
++        }
++    }
++#endif
++
+     int threads = 1;
+     while (threads < n_experts) {
+         threads <<= 1;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 248940e..0b5f4ce 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1541,13 +1541,13 @@ uint32_t llama_context::graph_max_nodes() const {
+         return uint32_t(std::min<uint64_t>(std::numeric_limits<uint32_t>::max(),
+                                          std::max<uint64_t>(65536, nodes)));
+     }
+-    return std::max<uint32_t>(1024u, 8u*model.n_tensors());
++    return std::max<uint32_t>(8192u, 12u*model.n_tensors());
+ }
+ // uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+ //     if (llm_arch_is_qwen_delta_net(model.arch)) {
+ //         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+ //     }
+-//     return std::max<uint32_t>(1024u, 8u*model.n_tensors());
++//     return std::max<uint32_t>(8192u, 12u*model.n_tensors());
+ // }
+ 
+ llm_graph_result * llama_context::get_gf_res_reserve() const {

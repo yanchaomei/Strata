@@ -107,6 +107,9 @@ public:
     int32_t chord_cap_prefix(int32_t valid_rows, int32_t at_layer) {
         return chord_abort_.cap_live_prefix(valid_rows, at_layer);
     }
+    int32_t chord_lossless_keep(int32_t n_keep) const {
+        return chord_abort_.lossless_commit_cap(n_keep);
+    }
     strata::chordmoe::ChordAbortController& chord_abort_controller() { return chord_abort_; }
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.

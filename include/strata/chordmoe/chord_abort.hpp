@@ -1,24 +1,27 @@
-// include/strata/chordmoe/chord_abort.hpp - Graph-Preserving Mid-Window Dead-Suffix Offload Elision.
+// include/strata/chordmoe/chord_abort.hpp - Graph-Preserving Mid-Window Dead-Suffix Offload Elision
+// & Doorbell-Driven Online Speculative Divergence Probe.
 //
-// KEY SYSTEMS INVARIANT:
-// In a captured CUDA Graph speculative verify window over positions [p0 .. p0 + T), destroying or halting the
-// graph mid-pass would corrupt stream synchronization and force costly graph recaptures (the trap FineMoE hits).
-// However, in Strata's doorbell architecture (`Verifier::run` / `Verifier::service`), 80-90% of an offloaded
-// window's wall-clock latency sits OUTSIDE the captured graph inside `PoolMultiFn(user, x_f, ids, n_tok, k, out, l)`
-// (reading hundreds of MBs of cold experts from DDR5 RAM or streaming them over PCIe).
-//
-// Because causal attention (QSA) and recurrent DeltaNet (GDN) never allow an earlier position t1 < n_live to read
-// activations or K/V states from a future position t2 >= n_live, and `Verifier::commit(n_keep)` commits at most
-// `n_keep <= n_live` tokens, eliding ALL offloaded CPU/PCIe expert work for rows `[n_live .. n_tok)` from layer
-// `l*` onward (zeroing their `out` rows and raising the doorbell as normal):
-//   1. Keeps the captured CUDA Graph 100% intact with zero recapture and zero deadlock;
-//   2. Preserves 100% BIT-FOR-BIT mathematical exactness on all committed tokens `[0 .. n_keep)`!
+// KEY SYSTEMS INVARIANT & UNCONDITIONAL LOSSLESSNESS THEOREM:
+//   1. CUDA-Graph Preservation: In Strata's doorbell architecture (`Verifier::run` / `Verifier::service`), 80-90%
+//      of an offloaded window's wall-clock latency sits OUTSIDE the captured CUDA Graph inside `PoolMultiFn`
+//      (reading cold experts from DDR5 RAM or streaming them over PCIe).
+//   2. Unconditional Bit-Exactness under Heuristic Early Abort:
+//      Suppose at layer `l*` (`0 <= l* < L`), `cap_live_prefix(L_keep, l*)` shrinks the live prefix to
+//      `1 <= L_keep < T`, eliding offloaded expert reads for suffix rows `[L_keep .. T)` on layers `l* .. L-1`.
+//      By strict causal masking of QSA attention and GDN recurrence, rows `[0 .. L_keep)` execute 100% exact
+//      target arithmetic across all `L` layers (`out[0 .. L_keep)` are bit-for-bit identical to full decode).
+//      Capping the committed prefix length at `n_keep_cap = live_rows()` (`n_keep <= L_keep`) guarantees that
+//      every accepted draft token AND the bonus token `out[n_keep - 1]` (`n_keep - 1 < L_keep`) come exclusively
+//      from the untouched prefix `[0 .. L_keep)`. Even if an online probe triggers a false positive, the ONLY
+//      effect is accepting `L_keep` exact tokens in that step — output token distribution and greedy bits remain
+//      100% mathematically lossless (`0.000` KL divergence)!
 #pragma once
 
 #include "strata/chordmoe/chord_types.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -29,7 +32,8 @@ namespace strata::chordmoe {
 using ChordPoolFn = void (*)(void* user, const float* x_f, const int32_t* ids,
                              int64_t n_tok, int64_t k, float* out, int64_t layer);
 
-/// Lock-free per-window controller tracking the live speculative prefix `[0 .. live_rows)` during verification.
+/// Lock-free per-window controller tracking the live speculative prefix `[0 .. live_rows)` during verification,
+/// paired with an optional zero-GPU-overhead host doorbell online divergence probe.
 class ChordAbortController {
 public:
     ChordAbortController() = default;
@@ -42,10 +46,18 @@ public:
         abort_layer_.store(-1, std::memory_order_release);
         n_embd_ = n_embd;
         elided_row_layers_.store(0, std::memory_order_relaxed);
+        std::memset(div_streak_, 0, sizeof(div_streak_));
+    }
+
+    /// Optional: attach drafter/lookahead per-layer predicted Top-K expert IDs `[n_layers, total_rows, k]`
+    /// for Trajectory-Jaccard online divergence probing. Pass `nullptr` to clear.
+    void set_draft_trajectory(const int32_t* pred_ids, int32_t n_layers, int32_t stride_k) {
+        draft_pred_ids_ = pred_ids;
+        draft_pred_layers_ = n_layers;
+        draft_pred_k_ = stride_k;
     }
 
     /// Monotonically shrink the live speculative prefix to `valid_rows` (`>= 1`; anchor row 0 is never aborted).
-    /// Can be signaled from an early-exit probe head, an intermediate router-divergence detector, or host thread.
     int32_t cap_live_prefix(int32_t valid_rows, int32_t at_layer) {
         const int32_t clamped = std::max<int32_t>(1, valid_rows);
         int32_t cur = live_rows_.load(std::memory_order_acquire);
@@ -65,6 +77,80 @@ public:
     int32_t total_rows() const { return total_rows_.load(std::memory_order_relaxed); }
     int32_t abort_layer() const { return abort_layer_.load(std::memory_order_acquire); }
     uint64_t elided_row_layers() const { return elided_row_layers_.load(std::memory_order_relaxed); }
+
+    /// Maximum tokens `Verifier::commit(n_keep)` may commit while preserving 100% unconditional bit-exactness.
+    int32_t lossless_commit_cap(int32_t raw_n_keep) const {
+        return std::min<int32_t>(raw_n_keep, live_rows());
+    }
+
+    /// Zero-GPU-overhead Online Speculative Divergence Probe executed on host-mapped doorbell arrays `(h_ids, h_w)`
+    /// right before `PoolMultiFn` runs at `layer`:
+    ///   - Mode A (when `draft_pred_ids_` is available): measures Top-K Jaccard overlap `|S_target n S_draft| / k`.
+    ///     If `overlap < cfg.probe_jaccard_min` for `cfg.probe_patience` consecutive layers (`layer >= probe_warmup`),
+    ///     caps `live_rows` at `t` (eliding `t .. T-1` from THIS layer onward!).
+    ///   - Mode B (zero-prior fallback, works with MTP / DFlash2 / n-gram lookup without draft expert traces):
+    ///     compares normalized routing Shannon entropy `H(w_t) / log(k)` against anchor `t = 0`. Sustained router
+    ///     flatness/collapse (`H_norm(t) >= 0.88` and `H_norm(t) >= cfg.probe_entropy_ratio * H_norm(0)`) for
+    ///     `cfg.probe_patience` consecutive layers triggers `cap_live_prefix(t, layer)`.
+    int32_t observe_layer_routing(int64_t layer, int32_t tb, const int32_t* sub_ids, const float* sub_w,
+                                  int64_t n, int64_t k, const ChordConfig& cfg) {
+        if (!cfg.online_probe || n <= 0 || k <= 1 || sub_ids == nullptr) return live_rows();
+        const int32_t cur_live = live_rows();
+        if (cur_live <= 1) return cur_live;
+
+        const float inv_log_k = 1.0f / std::log((float) k);
+        auto row_norm_entropy = [&](const float* rw) -> float {
+            if (rw == nullptr) return 0.5f;
+            float h = 0.0f;
+            for (int64_t r = 0; r < k; ++r) {
+                const float p = std::max(rw[r], 1e-12f);
+                h -= p * std::log(p);
+            }
+            return h * inv_log_k;
+        };
+
+        if (tb == 0 && sub_w != nullptr) {
+            anchor_entropy_ = std::max(0.10f, row_norm_entropy(sub_w));
+        }
+
+        const bool has_traj = (draft_pred_ids_ != nullptr && layer >= 0 && layer < draft_pred_layers_ && draft_pred_k_ == k);
+        const int32_t tot = std::min<int32_t>(total_rows(), kChordMaxWindow);
+
+        for (int64_t local_t = 0; local_t < n; ++local_t) {
+            const int32_t t = tb + (int32_t) local_t;
+            if (t <= 0 || t >= cur_live || t >= tot) continue;
+
+            bool diverged = false;
+            if (has_traj) {
+                const int32_t* tgt = sub_ids + local_t * k;
+                const int32_t* prd = draft_pred_ids_ + ((size_t) layer * (size_t) total_rows() + (size_t) t) * (size_t) k;
+                int inter = 0;
+                for (int64_t i = 0; i < k; ++i) {
+                    for (int64_t j = 0; j < k; ++j) {
+                        if (tgt[i] == prd[j]) { ++inter; break; }
+                    }
+                }
+                const int denom = (int) (2 * k) - inter;
+                const float jaccard = denom > 0 ? (float) inter / (float) denom : 1.0f;
+                diverged = (jaccard < cfg.probe_jaccard_min);
+            } else if (sub_w != nullptr) {
+                const float ht = row_norm_entropy(sub_w + local_t * k);
+                diverged = (ht >= 0.88f && ht >= cfg.probe_entropy_ratio * anchor_entropy_);
+            }
+
+            if (diverged) {
+                ++div_streak_[t];
+                // Causal propagation: if token `t` has diverged for `probe_patience` layers past warmup,
+                // every token `>= t` in the chain is dead -> cap live prefix to `t`!
+                if (layer >= cfg.probe_warmup && div_streak_[t] >= cfg.probe_patience) {
+                    return cap_live_prefix(t, (int32_t) layer);
+                }
+            } else {
+                div_streak_[t] = 0;
+            }
+        }
+        return live_rows();
+    }
 
     /// Drop-in wrapper around `PoolMultiFn` for sub-range `[tb, tb + n)` of the verify window:
     ///   - Computes offloaded experts ONLY for rows intersecting `[0, live_rows())`;
@@ -93,7 +179,6 @@ public:
         elided_row_layers_.fetch_add((uint64_t) dead_rows, std::memory_order_relaxed);
     }
 
-    /// Context struct allowing `ChordAbortController` to wrap any `(PoolMultiFn, user)` pair without changing ABI.
     struct PoolAdapterCtx {
         ChordAbortController* ctrl = nullptr;
         ChordPoolFn           inner_pool = nullptr;
@@ -112,7 +197,7 @@ public:
     }
 
     /// Prune queued lookahead/DMA expert requests for a future layer so experts exclusively requested by
-    /// dead suffix rows `[live_rows .. n_tok)` are cancelled before hitting the PCIe bus!
+    /// dead suffix rows `[live_rows .. n_tok)` are cancelled before hitting the PCIe bus.
     std::vector<int32_t> filter_live_experts(const int32_t* window_ids, int32_t n_tok, int32_t k,
                                              const int32_t* primary_res,
                                              const int32_t* peer_res = nullptr) const {
@@ -139,6 +224,11 @@ private:
     std::atomic<int32_t>  abort_layer_{-1};
     int64_t               n_embd_ = 0;
     std::atomic<uint64_t> elided_row_layers_{0};
+    const int32_t*        draft_pred_ids_ = nullptr;
+    int32_t               draft_pred_layers_ = 0;
+    int32_t               draft_pred_k_ = 0;
+    float                 anchor_entropy_ = 0.5f;
+    int32_t               div_streak_[kChordMaxWindow] = {};
 };
 
 }  // namespace strata::chordmoe
