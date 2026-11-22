@@ -50,6 +50,8 @@ struct ChordConfig {
     int32_t   rank_lo          = 4;      ///< First Top-K rank eligible for Mode 1 set-cover replacement (0-indexed; head ranks 0..rank_lo-1 stay exact).
     int32_t   rank_hi          = 31;     ///< Last Top-K rank eligible (clamped to k - 1).
     bool      protect_anchor   = true;   ///< Never alter token t = 0 (the verified/accepted anchor token).
+    bool      enable_free_ride = true;   ///< Wave 1: keep cold tail experts already in paid_cold_bm at zero distortion.
+    bool      enable_paid_coalesce = true; ///< Wave 2 Tier-3: allow coalescing onto cold experts already in paid_cold_bm.
     bool      early_abort      = false;  ///< Enable graph-preserving mid-window dead-suffix offload elision (`STRATA_CHORD_EARLY_ABORT=1`).
     bool      online_probe     = false;  ///< Enable zero-GPU-cost doorbell online divergence probe (`STRATA_CHORD_ONLINE_PROBE=1`).
     int32_t   probe_warmup     = 6;      ///< Minimum layer index before the online divergence probe may cap the suffix.

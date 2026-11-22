@@ -223,7 +223,7 @@ inline void chord_reshape_window(const float* logits, int32_t* ids, float* weigh
 
                 // Free-ride check: if cold expert `e` is ALREADY required by anchor t=0 or an earlier wave,
                 // keeping `e` incurs ZERO extra offloaded expert weight loads!
-                if (bm_test(paid_cold_bm, e)) {
+                if (cfg.enable_free_ride && bm_test(paid_cold_bm, e)) {
                     if (stats != nullptr) ++stats->free_ride_kept;
                     continue;
                 }
@@ -235,7 +235,8 @@ inline void chord_reshape_window(const float* logits, int32_t* ids, float* weigh
 
                 for (int32_t f = 0; f < n_expert; ++f) {
                     const ExpertTier tier_f = classify_expert_tier(f, primary_res, peer_res);
-                    const bool in_paid_union = (tier_f == ExpertTier::ColdHost) && bm_test(paid_cold_bm, f);
+                    const bool in_paid_union = cfg.enable_paid_coalesce &&
+                                               (tier_f == ExpertTier::ColdHost) && bm_test(paid_cold_bm, f);
                     if (tier_f == ExpertTier::ColdHost && !in_paid_union) continue;
 
                     if (row_l[e] - row_l[f] > eff_margin) continue;

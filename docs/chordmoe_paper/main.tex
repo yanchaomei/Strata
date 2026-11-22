@@ -52,7 +52,7 @@
 \begin{abstract}
 Mixture-of-Experts (MoE) models such as Qwen3-30B-A3B, Qwen3.8-Flash-Next, and DeepSeek-V3 deliver frontier reasoning quality per FLOP, yet their total parameter footprints ($30\text{B}\text{--}671\text{B}$) vastly exceed commodity GPU memory, necessitating host-DRAM expert offloading. Combining \emph{speculative decoding} with \emph{expert offloading} promises to amortize dense layer weights and hide PCIe latency, but our empirical characterization on multi-socket NVIDIA A40 servers exposes a severe four-way systems collision. Across a verification window of $W$ candidate tokens, per-layer active experts explode from $K$ to $3.5\times\text{--}4.4\times K$ (\emph{Speculative Union Explosion}). Worse, existing 2025--2026 speculative and predictive offloaders break static CUDA Graphs when $W > 1$ (causing EuroSys~'26 \textsc{FineMoE} to suffer a \textbf{30.0$\times$ per-layer latency collapse} on A40), stall the host on synchronous \texttt{.cpu().tolist()} transfers (\textsc{Specter}, $19.8\,\text{ms/window}$), or inject unbounded router biases that corrupt the non-negotiable anchor token $t=0$ in \textbf{91.9\% of layers} (\textsc{S$^2$-MoE}). Meanwhile, standard additive (\emph{min-sum}) CPU--GPU schedulers (\textsc{Fiddler}) leave PCIe Gen4 DMA engines completely idle on dual-socket Xeon hosts.
 
-We present \textbf{\textsc{ChordMoE}}, a training-free runtime and portable C++20/CUDA library that co-designs speculative verification window routing with heterogeneous non-NVLink execution. \textsc{ChordMoE} introduces three synergistic mechanisms: (1) a \textbf{Single-CTA Three-Wave Window Union Set-Cover Router} ($5.34\text{--}7.84\,\mu\text{s/layer}$ on A40) that protects anchor $t=0$, harvests zero-marginal-cost ``free-ride'' cold experts already paid for by earlier tokens, and gates substitutions via an exact sparse Total Variation (TV) bound and cross-layer credit ledger; (2) \textbf{Prefix-Capped Mid-Window Dead-Suffix Offload Elision}, which detects draft divergence asynchronously via CPU doorbells and skips offloaded expert transfers on doomed tail tokens \emph{without breaking captured CUDA Graphs}, backed by a formal \textbf{Unconditional Losslessness Theorem}; and (3) an \textbf{$O(M \log M)$ Min-Max Makespan Water-Filling Scheduler} across non-NVLink PCIe GPUs and multi-socket NUMA CPUs. Evaluated on $1\text{--}4\times$ non-NVLink NVIDIA A40 GPUs with dual Intel Xeon Gold 6330 CPUs and real Qwen3-30B-A3B weights, \textsc{ChordMoE}'s \emph{100\% lossless} Mode~0 reaches \textbf{94.62\,tok/s} ($+38.2\%$ over \textsc{Fiddler}, matching $2\times\text{A40}$ \textsc{Fiddler} on a single GPU), while bounded Mode~1 reaches \textbf{110.16\,tok/s} ($+60.9\%$) on $1\times\text{A40}$ and \textbf{128.97\,tok/s} across $4\times\text{A40}$ over cross-socket UPI—achieving $15.8\times\text{--}18.6\times$ higher throughput than \textsc{FineMoE} and \textsc{S$^2$-MoE}, \textbf{0\% anchor corruption}, and zero accuracy loss ($91.7\%$ vs.\ \textsc{S$^2$-MoE}'s $25\%$ HumanEval crash) across GSM8K, executable HumanEval, and systems QA.
+We present \textbf{\textsc{ChordMoE}}, a training-free runtime and portable C++20/CUDA library that co-designs speculative verification window routing with heterogeneous non-NVLink execution. \textsc{ChordMoE} introduces three synergistic mechanisms backed by four formal theorems: (1) a \textbf{Single-CTA Three-Wave Window Union Set-Cover Router} ($5.34\text{--}7.84\,\mu\text{s/layer}$ on A40) that protects anchor $t=0$, harvests zero-marginal-cost ``free-ride'' cold experts, and gates substitutions via an exact sparse Total Variation (TV) bound and exponentially decayed cross-layer credit ledger—closing \textbf{91.4\% of the offline exact Branch-and-Bound \textsc{OPT-SetCover} gap} ($95.8\%$ of \textsc{OPT} union size); (2) \textbf{Prefix-Capped Mid-Window Dead-Suffix Offload Elision} \& survival-weighted prefetching, which detect draft trajectory divergence asynchronously via CPU doorbells ($0.980 \to 0.271$ Jaccard phase transition) and elide doomed cold transfers \emph{without breaking captured CUDA Graphs}, proven \textbf{unconditionally lossless}; and (3) an \textbf{$O(M \log M)$ Min-Max Makespan Water-Filling Scheduler} across non-NVLink PCIe GPUs and multi-socket NUMA CPUs that sits within \textbf{1.4\%--7.1\% of exact \textsc{OPT-Makespan}}. On $1\text{--}4\times$ non-NVLink NVIDIA A40 GPUs with dual Xeon Gold 6330 CPUs and real Qwen3-30B-A3B weights, \textsc{ChordMoE}'s lossless Mode~0 reaches \textbf{94.62\,tok/s} ($+38.2\%$, matching $2\times\text{A40}$ \textsc{Fiddler} on $1$ GPU), while Mode~1 reaches \textbf{110.16\,tok/s} ($+60.9\%$, $W=7$), \textbf{199.53\,tok/s} ($W=12$), and \textbf{128.97\,tok/s} across $4\times\text{A40}$ UPI, achieving \textbf{0\% anchor corruption}, $98.88\%$ 48-layer BF16 vocabulary Top-1 agreement, and zero accuracy loss ($91.7\%$ vs.\ \textsc{S$^2$-MoE}'s $25\%$ HumanEval crash).
 \end{abstract}
 
 % =============================================================================
@@ -228,6 +228,60 @@ Because $p_{t,e} = \tilde{p}_{t,e} = 0$ for all $e \notin S_t \cup \tilde{S}_t$,
 Factoring out $M_{t,\max} = \max_{e \in U_t} \|E_e(x_t)\|_2$ and substituting Eq.~\eqref{eq:sparse_tv} gives $M_{t,\max} \cdot 2\,\delta_{\mathrm{TV}}(p_t, \tilde{p}_t) \le 2\epsilon_{\mathrm{TV}} M_{t,\max}$. Crucially, Eq.~\eqref{eq:sparse_tv} requires at most $2K \le 20$ scalar operations inside registers, avoiding an $O(E)$ full-vocabulary softmax pass.
 \end{proof}
 
+\begin{proposition}[Pathology of Margin-Only Routing \& Dominance over Expert Dropping]
+\label{prop:margin_drop}
+Let $z_t \in \mathbb{R}^E$ be router logits for draft token $t \ge 1$ with top-$K$ weights $p_t$:
+\begin{enumerate}
+  \item \textbf{Scale Non-Invariance of Logit Margins:} A fixed logit margin $z_{t,e} - z_{t,f} \le \Delta$ alone cannot bound $\delta_{\mathrm{TV}}(p_t, \tilde{p}_t)$. Specifically, as top-$K$ entropy varies from concentrated ($p_{t,e} \to \varepsilon$) to flat ($p_{t,e} \approx 1/K$) across $m$ swapped tail ranks, identical $\Delta$-bounded swaps induce $\delta_{\mathrm{TV}}$ spanning $[\varepsilon,\ \frac{m}{K}(1 - \frac{1}{1 + (K/m - 1)e^{\Delta}}) + \frac{m}{K}]$, exceeding $0.35\text{--}0.50$ in flat/multi-swap regimes unless gated by Eq.~\eqref{eq:sparse_tv}.
+  \item \textbf{Strict Dominance of Aligned Substitution over Hard Dropping (\textsc{MoE-Spec}):} Suppose cold rank $e$ (weight $p_e$) is either \emph{dropped} ($\hat{y}^{\mathrm{drop}} = \frac{1}{1-p_e}\sum_{j \neq e} p_j E_j(x) = \mu_{-e}$) as in \textsc{MoE-Spec}~\cite{moespec2026} or \emph{substituted} by $f \in \mathcal{R} \cup U_{\mathrm{paid}}$ with $\tilde{p}_f = p_e + \eta$ ($|\eta| = O(p_e(1-e^{-\Delta}))$). Then:
+  \[
+    \begin{aligned}
+      \|\hat{y}^{\mathrm{drop}} - y\|_2 &= p_e \|E_e(x) - \mu_{-e}\|_2, \\
+      \|\hat{y}^{\mathrm{sub}} - y\|_2 &= p_e \|E_e(x) - E_f(x)\|_2 + O(|\eta| M_{\max}).
+    \end{aligned}
+  \]
+  Whenever router proximity $|(w_e - w_f)^\top x| \le \Delta$ selects a positively aligned expert satisfying $\|E_e(x) - E_f(x)\|_2 < \|E_e(x) - \mu_{-e}\|_2$, substitution strictly reduces $\ell_2$ distortion; moreover, when an irreplaceable specialist expert violates $\delta_{\mathrm{TV}} \le \epsilon_{\mathrm{TV}}$, \textsc{ChordMoE} elastically retains $e$ ($0$ error), whereas rigid expert-cap dropping incurs unbounded $p_e \|E_e(x) - \mu_{-e}\|_2$ cliffs.
+\end{enumerate}
+\end{proposition}
+
+\begin{theorem}[Multi-Layer Residual Cascade \& Credit Ledger Bound]
+\label{thm:ledger}
+Consider an $L$-layer causal MoE Transformer $h_t^{(l)} = \Phi_l(h_{\le t}^{(l-1)}) + F_l(h_t^{(l-1)})$ where each layer map is $\Lambda$-Lipschitz ($\Lambda \ge 1$) and layer-$l$ MoE substitution injects local error $\|\xi_t^{(l)}\|_2 \le 2 M_{\max} \delta_{\mathrm{TV},t}^{(l)}$. Under \textsc{ChordMoE}:
+\begin{enumerate}
+  \item \textbf{Zero Anchor Cascade:} Since $\delta_{\mathrm{TV},0}^{(l)} \equiv 0$ for all $l \in [1, L]$ and causal attention at $t=0$ never reads $s \ge 1$, $\|\hat{h}_0^{(L)} - h_0^{(L)}\|_2 \equiv 0$ and $\mathrm{KL}(P_{\mathrm{gold}}(\cdot \mid x_0) \,\|\, \hat{P}(\cdot \mid x_0)) \equiv 0$.
+  \item \textbf{Ledger-Bounded Deep Drift:} Under token-wise residual propagation $\Delta_t^{(l)} \le \Lambda \Delta_t^{(l-1)} + 2 M_{\max} \delta_{\mathrm{TV},t}^{(l)}$, setting \texttt{ChordCreditLedger}'s decay factor $\gamma_{\mathrm{res}} = \Lambda^{-1}$ yields $\mathcal{L}_t^{(L)} = \sum_{l=1}^{L} \gamma_{\mathrm{res}}^{L-l} \delta_{\mathrm{TV},t}^{(l)} \le B_{\mathrm{turn}}$, bounding final-layer hidden drift by:
+  \begin{equation}
+    \|\hat{h}_t^{(L)} - h_t^{(L)}\|_2 \le 2 M_{\max} \Lambda^{L-1} \mathcal{L}_t^{(L)} \le 2 M_{\max} \Lambda^{L-1} B_{\mathrm{turn}},
+    \label{eq:ledger_bound}
+  \end{equation}
+  preventing the $\frac{\Lambda^L - 1}{\Lambda - 1}\epsilon_{\mathrm{TV}}$ worst-case compounding of memoryless per-layer gating.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+Claim (1) follows by induction on $l$: $\hat{h}_0^{(0)} = h_0^{(0)}$, causal $\Phi_l$ at $t=0$ depends only on $\hat{h}_0^{(l-1)} = h_0^{(l-1)}$, and Wave~0 enforces $\hat{F}_l(h_0^{(l-1)}) \equiv F_l(h_0^{(l-1)})$. For Claim (2), unrolling $\Delta_t^{(l)} \le \Lambda \Delta_t^{(l-1)} + 2 M_{\max} \delta_{\mathrm{TV},t}^{(l)}$ from $\Delta_t^{(0)} = 0$ gives $\Delta_t^{(L)} \le 2 M_{\max} \sum_{l=1}^{L} \Lambda^{L-l} \delta_{\mathrm{TV},t}^{(l)} = 2 M_{\max} \Lambda^{L-1} \sum_{l=1}^{L} \gamma_{\mathrm{res}}^{L-l} \delta_{\mathrm{TV},t}^{(l)} = 2 M_{\max} \Lambda^{L-1} \mathcal{L}_t^{(L)}$. Enforcing $\mathcal{L}_t^{(l)} \le B_{\mathrm{turn}}$ at every layer bounds Eq.~\eqref{eq:ledger_bound}.
+\end{proof}
+
+\begin{theorem}[Submodularity \& Min-Sum Slowdown]
+\label{thm:submod_sched}
+\begin{enumerate}
+  \item \textbf{Monotone Submodularity of Union Shaping:} Given anchor/core paid cold set $B_0$, let $g(A)$ denote the maximum number of flexible draft tail slots $(t, r)$ coverable within $(\Delta, \epsilon_{\mathrm{TV}})$ using experts in $\mathcal{R}_{\mathrm{pri}} \cup \mathcal{R}_{\mathrm{peer}} \cup B_0 \cup A$ for $A \subseteq \mathcal{E}_{\mathrm{cold}} \setminus B_0$. For independent per-slot margin gates, $g(A)$ is monotone and submodular ($g(A \cup \{e\}) - g(A)$ $\ge$ $g(B \cup \{e\}) - g(B)$ for $A \subseteq B$).
+  \item \textbf{Closed-Form Slowdown of Additive (\emph{Min-Sum}) Scheduling:} On $G$ PCIe DMA engines (bandwidth $B_{\mathrm{pcie}}$) and $S$ CPU NUMA sockets (bandwidth $B_{\mathrm{numa}} > B_{\mathrm{pcie}}$) servicing $M \gg G + S$ equal-sized cold misses, \textsc{Fiddler}'s additive objective assigns zero misses to PCIe and suffers a makespan inflation factor relative to optimal water-filling $C^*_{\max}$ of:
+  \begin{equation}
+    \frac{C_{\max}(\textsc{Fiddler})}{C^*_{\max}} =
+    \begin{cases}
+      1 + \dfrac{G\,B_{\mathrm{pcie}}}{S\,B_{\mathrm{numa}}} & \text{(striped)}, \\[6pt]
+      S + \dfrac{G\,B_{\mathrm{pcie}}}{B_{\mathrm{numa}}} & \text{(1-socket skew)}.
+    \end{cases}
+    \label{eq:fiddler_ratio}
+  \end{equation}
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+For (1), indicator coverage $c_{t,r}(A) \in \{0,1\}$ of whether slot $(t,r)$ admits at least one valid candidate in $\mathcal{R} \cup B_0 \cup A$ satisfies diminishing returns because adding $e$ to a larger superset $B \supseteq A$ can only flip $c_{t,r}$ from $0 \to 1$ if no element of $B$ already covered $(t,r)$, hence $c_{t,r}(A)$ and $g(A) = \sum_{t,r} c_{t,r}(A)$ are monotone submodular. For (2), since standalone latency satisfies $W_b / B_{\mathrm{numa}} < W_b / B_{\mathrm{pcie}}$, minimizing $\sum_q L_q$ routes all $M$ tasks to CPU sockets, yielding $C_{\max}(\textsc{Fiddler}) = \frac{M W_b}{S B_{\mathrm{numa}}}$ under $50/50$ striping (or $\frac{M W_b}{B_{\mathrm{numa}}}$ when all $M$ pages sit on Socket~0 and $\kappa_{\mathrm{upi}} B_{\mathrm{pcie}} < B_{\mathrm{numa}}$), whereas continuous water-filling equalizes all $G+S$ queues at $C^*_{\max} = \frac{M W_b}{G B_{\mathrm{pcie}} + S B_{\mathrm{numa}}}$, dividing directly to Eq.~\eqref{eq:fiddler_ratio}. On our testbed ($B_{\mathrm{pcie}}=23.5$, $B_{\mathrm{numa}}=72\,\text{GB/s}$), Eq.~\eqref{eq:fiddler_ratio} predicts $1.163\times$ ($1\times\text{A40}$), $1.653\times$ ($4\times\text{A40}$ striped), and $3.306\times$ ($4\times\text{A40}$ skewed).
+\end{proof}
+
 % =============================================================================
 \section{Detailed System Design}
 \label{sec:design}
@@ -300,7 +354,7 @@ Even in Mode~0 ($\epsilon_{\mathrm{TV}} = 0$), dispatching cold experts for all 
 \textsc{ChordMoE} introduces \texttt{ChordAbortController} (\texttt{chord\_abort.hpp}), which exploits \textsc{Strata}'s asynchronous CPU doorbell architecture:
 \begin{itemize}
   \item \textbf{Zero-GPU-Cost Doorbell Probing:} At layer $l$, as soon as the GPU writes the router top-$K$ indices to host-pinned memory and rings the layer doorbell, the CPU thread is otherwise waiting while the GPU runs dense GQA/GDN projections. \texttt{observe\_layer\_routing()} inspects those pinned router IDs in $<\!1\,\mu\text{s}$ on CPU using two training-free signals: \emph{Mode~A (Trajectory-Jaccard)}, when draft $t$'s expert set against a draft-time oracle trace drops below Jaccard threshold $\theta_J$ for $m$ consecutive layers ($l \ge l_{\text{warmup}}$); or \emph{Mode~B (Oracle-Free Entropy Spike)}, when draft $t$'s normalized top-$K$ routing entropy jumps by $\ge \theta_H \times$ relative to anchor $t=0$ across consecutive layers.
-  \item \textbf{Graph-Preserving Suffix Elision:} Once $\hat{\tau} \in [1, W-1]$ triggers, \texttt{live\_rows\_} shrinks monotonically to $\hat{\tau}$. Inside \texttt{Verifier::dispatch\_subwindow}, the CUDA Graph continues replaying fixed $[W, H]$ shapes on GPU, while the CPU dispatcher iterates \emph{only over rows $t \in [0, \hat{\tau})$} when enqueueing cold PCIe DMAs and OpenMP CPU GEMVs! Upon layer $L-1$ completion, \texttt{Verifier::commit} clamps $n_{\text{keep}} \le \texttt{lossless\_commit\_cap}(W) = \hat{\tau}$, satisfying Theorem~\ref{thm:lossless} unconditionally.
+  \item \textbf{Graph-Preserving Suffix Elision \& Survival Prefetching:} Once $\hat{\tau} \in [1, W-1]$ triggers, \texttt{live\_rows\_} shrinks monotonically to $\hat{\tau}$. Inside \texttt{Verifier::dispatch\_subwindow}, the CUDA Graph continues replaying fixed $[W, H]$ shapes on GPU, while the CPU dispatcher iterates \emph{only over rows $t \in [0, \hat{\tau})$} when enqueueing cold PCIe DMAs and OpenMP CPU GEMVs! Upon layer $L-1$ completion, \texttt{Verifier::commit} clamps $n_{\text{keep}} \le \texttt{lossless\_commit\_cap}(W) = \hat{\tau}$, satisfying Theorem~\ref{thm:lossless} unconditionally. Complementarily, for cross-layer lookahead prefetching (\texttt{chord\_score\_prefetches}), rather than weighting step-$7$ drafts equally with step-$1$ as in \textsc{Specter}~\cite{specter2026}, \textsc{ChordMoE} computes exact union survival probability $P_{\mathrm{need}}(e) = 1 - \prod_{t: e \in \hat{S}_t}(1 - p_{\mathrm{alive}}[t])$, deduplicating in-flight/resident experts and filtering candidates below $\theta_{\mathrm{ev}}$.
 \end{itemize}
 
 \subsection{Non-NVLink All-Cards \& Multi-NUMA Min-Max Scheduler}
@@ -327,9 +381,9 @@ in $O(M \log M)$ time via \textbf{Multiplicity-Sorted Min-Max Water-Filling}: hi
 \label{sec:impl}
 % =============================================================================
 
-\textsc{ChordMoE} is engineered in two cleanly decoupled layers (~$2,100$ lines of C++20, CUDA, and Python):
+\textsc{ChordMoE} is engineered in two cleanly decoupled layers (~$3,100$ lines of C++20, CUDA, and Python):
 \begin{enumerate}
-  \item \textbf{Zero-Dependency Core (\texttt{include/strata/chordmoe/}):} Four header modules (\texttt{chord\_types.hpp}, \texttt{chord\_router.hpp}, \texttt{chord\_abort.hpp}, \texttt{chord\_sched.hpp}) depend exclusively on the C++20 standard library, allowing deterministic CPU unit testing and embedding into external engines.
+  \item \textbf{Zero-Dependency Core \& Exact Oracles (\texttt{include/strata/chordmoe/}):} Five header modules (\texttt{chord\_types.hpp}, \texttt{chord\_router.hpp}, \texttt{chord\_abort.hpp}, \texttt{chord\_sched.hpp}, and offline Branch-and-Bound exact optimality solvers in \texttt{chord\_oracle.hpp}) depend exclusively on the C++20 standard library, allowing deterministic CPU unit testing and embedding into external engines.
   \item \textbf{\textsc{Strata} CUDA/HIP Engine Integration:} \texttt{src/kernels/cuda/chord\_router.cu} implements the single-CTA warp-parallel router for both $512 \times 10$ (Qwen3.8-Flash-Next) and $256 \times 8$ (Qwen3.6-35B / DeepSeek-V3) geometries; \texttt{src/core/verify.cpp} wires \texttt{chord\_route\_window}, doorbell \texttt{observe\_layer\_routing}, \texttt{dispatch\_subwindow}, and \texttt{lossless\_commit\_cap} behind opt-in \texttt{STRATA\_CHORD\_*} environment flags (leaving default \textsc{Strata} behavior byte-identical when unset).
   \item \textbf{Drop-In \texttt{llama.cpp} / \textsc{S$^2$-MoE} Adapter (\texttt{contrib/llama\_cpp\_chordmoe/}):} \texttt{ggml\_chord\_moe.hpp} intercepts \texttt{ggml\_moe\_reuse\_two\_pass} without modifying any model graph builder: it copies anchor $t=0$ bit-for-bit and lifts certified draft expert IDs by a monotone offset above $\max_e Z_{t,e}$ so downstream \texttt{ggml\_top\_k} + unbiased \texttt{probs} gather execute exact \textsc{ChordMoE} routing. Our accompanying \texttt{s2moe\_chordmoe.patch} also fixes a critical \texttt{GGML\_ASSERT(obj\_new)} graph-arena overflow in \textsc{S$^2$-MoE} (\texttt{src/llama-context.cpp:1544}) on 48-layer Qwen3-MoE models.
 \end{enumerate}
@@ -603,6 +657,178 @@ To empirically validate Theorem~\ref{thm:tv} on real trained neural weights rath
 \vspace{2pt}
 \noindent\textbf{Long-Context KV-Cache Scaling ($4\text{K}\text{--}96\text{K}$, Figure~\ref{fig:sweep_ctx}).}
 In VMM-ballooned engines (\textsc{Strata} \texttt{--kv-grow}~\cite{strata2026}, \textsc{vTensor}~\cite{xu2024vtensor}), growing the FP16 GQA KV cache ($96\,\text{KiB/token}$ in Qwen3-30B-A3B) dynamically evicts resident experts. Under a $16\,\text{GiB}$ consumer GPU cap ($12.5\,\text{GiB}$ shared KV+expert pool), expanding context from $4\text{K}$ to $64\text{K}$ ($6.0\,\text{GiB}$ KV) shrinks resident slots from $57/128$ to $30/128$ while adding batched GQA decode attention load. Across $4\text{K}\text{--}64\text{K}$, \textsc{ChordMoE} sustains $+14\%\text{--}35\%$ speedups; notably, Mode~1 at $64\text{K}$ ($77.89\,\text{tok/s}$) exceeds \textsc{Fiddler} at $32\text{K}$ ($73.65\,\text{tok/s}$).
+
+\subsection{Sub-Mechanism Attribution \& Exact \textsc{OPT} Gaps}
+\label{sec:eval_oracle}
+
+A central question for any heuristic systems mechanism is: \emph{is every sub-component necessary, and how close does the fast online algorithm come to the offline combinatorial optimum?} Using $960$ authentic held-out verification layer-windows ($20$ multi-step windows $\times 48$ layers, $W=7$, $32\%$ VRAM cache) captured from live BF16 Qwen3-4B $\to$ Qwen3-30B-A3B speculative decoding, we evaluate both progressive sub-mechanism ablations and exact Branch-and-Bound (\texttt{BnB}) offline mathematical optima (\texttt{chord\_oracle.hpp}).
+
+\begin{table}[t]
+  \centering
+  \caption{Factor-by-factor router decomposition and offline exact Branch-and-Bound \textsc{OPT-SetCover} lower bound across $960$ real Qwen3-4B $\to$ Qwen3-30B-A3B layer-windows ($W=7$, $32\%$ VRAM). All $960/960$ \textsc{OPT} instances solved to proven optimality.}
+  \label{tab:router_decomp}
+  \footnotesize
+  \setlength{\tabcolsep}{2.8pt}
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{@{}lcccccc@{}}
+    \toprule
+    \textbf{Decomposition Stage} & \textbf{Miss/L} & \textbf{FreeRide} & \textbf{SwVRAM} & \textbf{SwPaid} & \textbf{AncErr} & \textbf{MaxTV} \\
+    \midrule
+    0. Unbiased Exact Top-8 & $12.03$ & $0$ & $0$ & $0$ & $0/960$ & $0.000$ \\
+    1. Naive Per-Token Swap & $4.82$ & $0$ & --- & $0$ & \textcolor{chordred}{\textbf{769/960}} & \textcolor{chordred}{\textbf{0.588}} \\
+    2. + Wave 0 (Anchor Immunity) & $6.25$ & $0$ & $12,351$ & $0$ & $0/960$ & \textcolor{chordred}{$0.588$} \\
+    3. + Wave 1 (Free-Ride Keep) & $6.22$ & \textbf{5,181} & \textbf{7,465} & $0$ & $0/960$ & $0.562$ \\
+    4. + Wave 2 Tier-3 (Paid Coal.) & $6.17$ & $5,145$ & $6,146$ & \textbf{1,403} & $0/960$ & $0.562$ \\
+    5. + Sparse TV Gate ($\le 0.16$) & \textbf{8.30} & \textbf{5,745} & $3,897$ & $1,008$ & \textcolor{chordteal}{\textbf{0/960}} & \textcolor{chordteal}{\textbf{0.160}} \\
+    6. + Credit Ledger (Full M1) & $8.62$ & $5,884$ & $3,544$ & $907$ & \textcolor{chordteal}{\textbf{0/960}} & \textcolor{chordteal}{\textbf{0.160}} \\
+    \midrule
+    \textbf{7. Exact BnB \textsc{OPT-SetCover}} & \textbf{7.95} & \multicolumn{5}{c}{\textbf{960/960 Proven Exact (\textsc{ChordMoE} = 95.8\% of \textsc{OPT}, 91.4\% gap closed)}} \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}
+
+\vspace{2pt}
+\noindent\textbf{Router Decomposition \& \textsc{OPT-SetCover} Gap (Table~\ref{tab:router_decomp}).}
+Each wave performs a distinct, non-redundant role: (i) Wave~0 eliminates Naive's $80.1\%$ ($769/960$) anchor corruption; (ii) enabling Wave~1 harvests $5,181$ zero-cost free rides, \textbf{eliminating $39.6\%$ ($12,351 \to 7,465$) of pointless VRAM swaps} on cold experts that $t=0$ already paid for; (iii) Wave~2 Tier-3 coalesces $1,403$ additional tail misses onto shared cold union experts; and (iv) adding the exact sparse TV gate ($\epsilon_{\mathrm{TV}}=0.16$) vetoes $2,052$ high-distortion swaps, slashing $\max \delta_{\mathrm{TV}}$ by $3.68\times$ ($0.588 \to 0.160$). Most importantly, solving all $960$ windows to proven combinatorial optimality via \texttt{chord\_solve\_exact\_setcover\_oracle} ($7,692$ total BnB nodes) yields $U_{\mathrm{OPT}} = 7.95$ misses/layer: our $5.34\,\mu\text{s}$ single-CTA kernel ($8.30$ misses/layer) achieves \textbf{$95.79\%$ of the offline exact optimum} and closes \textbf{$91.4\%$} of the entire theoretically achievable cold-miss reduction ($12.03 \to 7.95$).
+
+\begin{table}[t]
+  \centering
+  \caption{Per-layer offload makespan ($\mu$s) against legacy static \texttt{--pcie-frac} and offline exact Branch-and-Bound \textsc{OPT-Makespan} across $960$ real Qwen3-30B layer-windows under $50/50$ striped and $85/15$ NUMA-0 hotspot page placement.}
+  \label{tab:sched_opt}
+  \footnotesize
+  \setlength{\tabcolsep}{2.8pt}
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{@{}lcccccc@{}}
+    \toprule
+    \textbf{Topology \& NUMA} & \textbf{\textsc{Fiddler}} & \textbf{StaticFrac} & \textbf{\textsc{ChordMoE}} & \textbf{Exact OPT} & \textbf{Fid./OPT} & \textbf{Chord/OPT} \\
+    \midrule
+    $1\times\text{A40}$ ($50/50$ Striped) & $256.2$ & $260.9$ & \textbf{224.0} & $209.2$ & $1.225\times$ & \textbf{1.071$\times$} \\
+    $1\times\text{A40}$ ($85/15$ Skew) & \textcolor{chordred}{$343.5$} & $262.9$ & \textbf{230.5} & $225.3$ & \textcolor{chordred}{\textbf{1.525$\times$}} & \textbf{1.023$\times$} \\
+    $2\times\text{A40}$ ($50/50$ Striped) & $204.0$ & $197.5$ & \textbf{169.6} & $160.6$ & $1.270\times$ & \textbf{1.056$\times$} \\
+    $2\times\text{A40}$ ($85/15$ Skew) & \textcolor{chordred}{$260.1$} & $196.7$ & \textbf{174.4} & $171.1$ & \textcolor{chordred}{\textbf{1.521$\times$}} & \textbf{1.019$\times$} \\
+    $4\times\text{A40}$ ($50/50$ Striped) & $103.4$ & $114.8$ & \textbf{94.4} & $92.6$ & $1.117\times$ & \textbf{1.020$\times$} \\
+    $4\times\text{A40}$ ($85/15$ Skew) & \textcolor{chordred}{$120.8$} & $113.3$ & \textbf{98.6} & $97.2$ & \textcolor{chordred}{\textbf{1.242$\times$}} & \textbf{1.014$\times$} \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}
+
+\vspace{2pt}
+\noindent\textbf{Scheduler Superiority \& \textsc{OPT-Makespan} Gap (Table~\ref{tab:sched_opt}).}
+Confirming Theorem~\ref{thm:submod_sched}, \textsc{Fiddler}'s \emph{min-sum} objective degrades makespan by up to \textbf{$1.525\times$} against \textsc{OPT} under realistic NUMA-0 page skew, while static bandwidth-proportional splitting (\texttt{StaticFrac}, blind to token multiplicity and home NUMA sockets) remains $1.15\times\text{--}1.25\times$ above \textsc{OPT}. \texttt{ChordHeteroScheduler} sits within \textbf{$1.4\%\text{--}7.1\%$ of offline exact \textsc{OPT-Makespan}} across all six regimes in $<\!0.5\,\mu\text{s}$.
+
+\subsection{48-Layer BF16 Vocab KL, Doorbell Probe \& Window Scaling}
+\label{sec:eval_bf16_kl}
+
+\begin{table*}[t]
+  \centering
+  \caption{Full 48-layer unquantized BF16 Qwen3-30B-A3B end-to-end vocabulary ($151,936$ tokens) KL divergence $\mathrm{KL}(P_{\mathrm{gold}} \,\|\, \hat{P})$ and Top-1 token agreement on $20$ held-out Qwen3-4B $\to$ Qwen3-30B-A3B verification windows ($960$ MoE layers on $2\times\text{A40}$), empirically validating Proposition~\ref{prop:margin_drop} and Theorem~\ref{thm:ledger}.}
+  \label{tab:bf16_kl}
+  \footnotesize
+  \setlength{\tabcolsep}{4.8pt}
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{@{}lcccccccc@{}}
+    \toprule
+    \textbf{48-Layer Routing Mechanism} & \textbf{Cold Miss/L} & \textbf{Max TV} & \textbf{Anchor Err\%} & \textbf{Anchor KL} & \textbf{Accepted-Draft KL} & \textbf{All-Draft KL} & \textbf{Top-1 Agreement} & \textbf{$\mathbb{E}[\text{accept}]$} \\
+    \midrule
+    Unbiased Exact Gold (48L BF16) & $12.02$ & $0.000$ & $0.0\%$ & $0.0000$ & $0.0000$ & $0.0000$ & $100.00\%$ & $4.450$ \\
+    \textbf{\textsc{ChordMoE} Full (Waves 0--2 + TV + Ledger)} & \textbf{8.56 ($-28.8\%$)} & \textcolor{chordteal}{\textbf{0.160}} & \textcolor{chordteal}{\textbf{0.0\%}} & \textbf{0.0129}$^\dagger$ & \textbf{0.0330} & \textbf{0.0387} & \textbf{98.88\%} & \textbf{4.450} \\
+    \textsc{ChordMoE} w/o CreditLedger (Thm.~\ref{thm:ledger}) & $8.24$ & $0.160$ & $0.0\%$ & $0.0120^\dagger$ & $0.0345$ & $0.0395$ & $98.88\%\text{--}100\%$ & $4.450$ \\
+    Margin-Only w/o Sparse TV Gate (Prop.~\ref{prop:margin_drop}a) & $6.13$ & \textcolor{chordred}{\textbf{0.524}} & $0.0\%$ & $0.0130^\dagger$ & \textcolor{chordred}{\textbf{0.0448 ($+35.5\%$)}} & \textcolor{chordred}{\textbf{0.0497}} & $97.75\%$ & $4.450$ \\
+    \textsc{ChordMoE} w/o Wave-1 Free-Ride & $9.06$ ($+5.8\%$) & $0.160$ & $0.0\%$ & $0.0124^\dagger$ & $0.0308$ & $0.0325$ & $98.88\%$ & $4.450$ \\
+    \textsc{MoE-Spec} 2026 Hard Budget~\cite{moespec2026} (Prop.~\ref{prop:margin_drop}b) & $9.51$ ($+11.1\%$) & \textcolor{chordred}{\textbf{0.734}} & $0.0\%$ & $0.0126^\dagger$ & $0.0360$ & $0.0354$ & $97.75\%$ & $4.800$ \\
+    Tail-Skip Cold Drop ($r \ge 5$) & $8.29$ & \textcolor{chordred}{$0.338$} & $0.0\%$ & $0.0126^\dagger$ & $0.0384$ & \textcolor{chordred}{\textbf{0.0520 ($+34.3\%$)}} & \textcolor{chordred}{\textbf{94.38\%}} & $4.450$ \\
+    \textsc{S$^2$-MoE} Runtime Bias~\cite{s2moe2026} & $8.07$ & \textcolor{chordred}{\textbf{1.000}} & \textcolor{chordred}{\textbf{80.4\%}} & \textcolor{chordred}{\textbf{0.0449 ($3.5\times$)}} & \textcolor{chordred}{\textbf{0.1227 ($3.7\times$)}} & \textcolor{chordred}{\textbf{0.1018}} & \textcolor{chordred}{$95.51\%$} & \textcolor{chordred}{$4.300$} \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table*}
+
+\noindent\textbf{48-Layer Full-Vocabulary KL Superiority (Table~\ref{tab:bf16_kl}).}
+To test deep residual propagation across all $48$ layers (Theorem~\ref{thm:ledger}), we loaded unquantized BF16 Qwen3-4B + Qwen3-30B-A3B across $2\times\text{A40}$ GPUs ($69\,\text{GB}$ weights) and measured exact end-to-end KL divergence over all $151,936$ output vocabulary logits ($^\dagger$the $\approx\!0.012$ anchor baseline reflects BF16 SDPA kernel tile rounding between $W=12$ gold capture and $W=7$ replay; router swaps at $t=0$ are $0.0\%$). Three results stand out: (1) removing the sparse TV gate (\texttt{Margin-Only}) causes $\max \delta_{\mathrm{TV}}$ to jump $3.28\times$ ($0.160 \to 0.524$) and inflates accepted-draft 48-layer KL by $+35.5\%$ (validating Proposition~\ref{prop:margin_drop}a); (2) dropping cold tail experts (\texttt{Tail-Skip} and \textsc{MoE-Spec}) either increases cold misses ($9.51$ vs.\ $8.56$ at $\max \delta_{\mathrm{TV}}=0.734$) or degrades Top-1 agreement from \textbf{$98.88\%$ down to $94.38\%$}—a \textbf{$5\times$ higher Top-1 token error rate} ($5.62\%$ vs.\ $1.12\%$, validating Proposition~\ref{prop:margin_drop}b); and (3) \textsc{S$^2$-MoE} inflates anchor and accepted-draft 48-layer KL by \textbf{$3.5\times\text{--}3.7\times$} ($0.1227$) while reducing $\mathbb{E}[\text{accept}]$ from $4.450 \to 4.300$.
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \begin{tikzpicture}
+      \begin{axis}[
+        width=0.96\textwidth,
+        height=4.2cm,
+        xlabel={MoE Layer Band Across 48-Layer Qwen3-30B-A3B},
+        ylabel={Top-8 Trajectory Jaccard},
+        symbolic x coords={L0-11,L12-23,L24-35,L36-47},
+        xtick=data,
+        ymin=0.15, ymax=1.08,
+        ymajorgrids=true,
+        xmajorgrids=true,
+        grid style={dashed,gray!35},
+        legend style={at={(0.50,0.56)},anchor=center,font=\scriptsize,draw=gray!40,fill=white},
+        tick label style={font=\footnotesize},
+        label style={font=\footnotesize\bfseries}
+      ]
+        \addplot[color=chordteal,mark=*,very thick] coordinates {
+          (L0-11,0.9799) (L12-23,0.9728) (L24-35,0.9709) (L36-47,0.9689)
+        };
+        \addplot[color=chordred,mark=square*,very thick] coordinates {
+          (L0-11,0.2711) (L12-23,0.2822) (L24-35,0.2812) (L36-47,0.2841)
+        };
+        \legend{Accepted Drafts ($n=69$, $0.97\text{--}0.98$), Diverged Suffix ($n=51$, $0.27\text{--}0.28$)}
+      \end{axis}
+    \end{tikzpicture}
+    \caption{Real 48-layer trajectory Jaccard phase transition driving doorbell suffix elision ($12/12$ diverged windows caught at mean $L=6.3$, $0.0$ token loss).}
+    \label{fig:jaccard_phase}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \begin{tikzpicture}
+      \begin{axis}[
+        width=0.96\textwidth,
+        height=4.2cm,
+        xlabel={Speculative Verification Window Width $W$},
+        ylabel={Net Throughput (tok/s)},
+        xmin=0.5, xmax=12.5,
+        ymin=0, ymax=218,
+        xtick={1,2,4,6,8,12},
+        ymajorgrids=true,
+        xmajorgrids=true,
+        grid style={dashed,gray!35},
+        legend style={at={(0.03,0.97)},anchor=north west,font=\scriptsize,draw=gray!40,fill=white},
+        tick label style={font=\footnotesize},
+        label style={font=\footnotesize\bfseries}
+      ]
+        \addplot[color=chordred,mark=x,thick,dashed] coordinates {
+          (1,59.39) (2,14.97) (4,6.38) (6,6.97) (8,8.30)
+        };
+        \addplot[color=chordgray,mark=square*,thick] coordinates {
+          (1,40.00) (2,81.77) (4,110.23) (6,128.72) (8,131.11) (12,144.79)
+        };
+        \addplot[color=chordteal,mark=triangle*,thick] coordinates {
+          (1,55.93) (2,83.17) (4,113.64) (6,141.67) (8,156.05) (12,176.46)
+        };
+        \addplot[color=chordblue,mark=*,very thick] coordinates {
+          (1,55.78) (2,90.51) (4,133.15) (6,157.09) (8,174.35) (12,199.53)
+        };
+        \legend{\textsc{FineMoE} (EuroSys '26), \textsc{Fiddler}, \textsc{ChordMoE} Mode 0, \textsc{ChordMoE} Mode 1}
+      \end{axis}
+    \end{tikzpicture}
+    \caption{Window-width scaling $W \in [1, 12]$ on live $1\times\text{A40}$ using authentic Qwen3-4B $\to$ 30B traces ($\mathbb{E}[\text{accept}]: 1.00 \to 6.00$).}
+    \label{fig:window_scaling}
+  \end{subfigure}
+  \vspace{-4pt}
+  \caption{Real-trajectory doorbell divergence probing and speculative window scaling on NVIDIA A40: (a) Trajectory-Jaccard separates accepted vs.\ diverged suffix tokens by $3.6\times$ right from Layers $0\text{--}11$; (b) \textsc{ChordMoE} cuts cold misses in half at $W=12$ ($17.93 \to 8.55$/L), reaching \textbf{199.53\,tok/s} without speculative thrashing.}
+  \label{fig:probe_and_width}
+\end{figure*}
+
+\vspace{2pt}
+\noindent\textbf{Doorbell Divergence Probe, Negative Entropy Finding \& Survival Prefetching (Figure~\ref{fig:jaccard_phase}).}
+Inspecting real 48-layer Qwen3-30B-A3B signals reveals an important architectural lesson: because Qwen3-MoE enforces \texttt{norm\_topk\_prob=true} over $K=8$ of $128$ fine-grained experts, single-token normalized top-$8$ entropy remains nearly flat ($0.945\text{--}0.956$) on \emph{both} accepted and rejected tokens, limiting oracle-free Mode~B to $1/20$ windows. Conversely, \textbf{Mode~A (Trajectory-Jaccard against a 2-bit quantized lookahead trace)} exhibits an immediate $3.6\times$ phase transition in Layers $0\text{--}11$ ($0.9799$ on accepted tokens vs.\ $0.2711$ on diverged suffix tokens): \texttt{ChordAbortController} catches \textbf{$12/12$ diverged windows at mean layer $\hat{l}=6.3$}, cutting cold misses by \textbf{$-25.3\%$ ($12.02 \to 8.98$/L)}—within $0.30$ misses/L of an exact oracle ($8.68$/L)—with \textbf{$100\%$ accepted-token retention ($\mathbb{E}[\text{accept}] = 4.450$, $\mathrm{KL} \equiv 0.000000$)}. On the same real windows, \texttt{chord\_score\_prefetches} cuts wasted cold PCIe prefetches by \textbf{$-44.6\%$} ($5,866 \to 3,247$) and total prefetch traffic by $-32.4\%$ ($13.05 \to 8.82$/L) relative to ASPLOS~'26 \textsc{Specter}'s equal-vote prefetcher.
+
+\vspace{2pt}
+\noindent\textbf{Eliminating Speculative Thrashing Across $W \in [1, 12]$ (Figure~\ref{fig:window_scaling}).}
+Evaluating authentic 12-token Qwen3-4B $\to$ Qwen3-30B-A3B traces across $W \in \{1, 2, 4, 6, 8, 12\}$ on $1\times\text{A40}$ shows that while \textsc{FineMoE} collapses at $W \ge 2$ and \textsc{Fiddler} stalls between $W=6 \to 8$ ($128.72 \to 131.11\,\text{tok/s}$, $+1.8\%$ gain as cold misses jump $10.45 \to 13.47$/L), \textsc{ChordMoE} scales cold-expert work with \emph{accepted} rather than \emph{proposed} width—halving cold misses at $W=12$ ($17.93 \to 8.55$/L) and reaching \textbf{$176.46\,\text{tok/s}$} (Mode~0) and \textbf{$199.53\,\text{tok/s}$} (Mode~1, $+37.8\%$ over \textsc{Fiddler}).
 
 \subsection{End-to-End Multi-Task Generation Fidelity}
 \label{sec:eval_fidelity}

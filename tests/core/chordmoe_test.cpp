@@ -1,5 +1,6 @@
 // tests/core/chordmoe_test.cpp - Unit tests & head-to-head C++ microbenchmark for ChordMoE (no GPU needed).
 #include "strata/chordmoe/chord_abort.hpp"
+#include "strata/chordmoe/chord_oracle.hpp"
 #include "strata/chordmoe/chord_router.hpp"
 #include "strata/chordmoe/chord_sched.hpp"
 #include "strata/chordmoe/chord_types.hpp"
@@ -542,6 +543,72 @@ void test_ggml_selection_logit_transform() {
     }
 }
 
+void test_exact_oracles_and_moespec_dominance() {
+    using namespace strata::chordmoe;
+    using namespace strata::chordmoe::ggml_adapter;
+
+    constexpr int T = 7, NE = 128, K = 8;
+    std::mt19937 rng(20261122);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> logits(T * NE);
+    std::vector<float> base(NE);
+    for (int e = 0; e < NE; ++e) base[(size_t) e] = nd(rng);
+    for (int t = 0; t < T; ++t) {
+        for (int e = 0; e < NE; ++e) {
+            logits[(size_t) t * NE + e] = 0.75f * base[(size_t) e] + 0.65f * nd(rng);
+        }
+    }
+    std::vector<int32_t> res_map(NE, -1);
+    for (int e = 0; e < 41; ++e) res_map[(size_t) e] = e;
+
+    std::vector<int32_t> base_ids(T * K);
+    std::vector<float>   base_w(T * K);
+    ggml_standard_topk_moe(logits.data(), T, NE, K, base_ids.data(), base_w.data());
+
+    ChordConfig cfg;
+    cfg.mode            = ChordMode::BoundedSetCover;
+    cfg.logit_margin    = 1.40f;
+    cfg.tv_budget_token = 0.16f;
+    cfg.rank_lo         = 3;
+    cfg.rank_hi         = K - 1;
+    cfg.protect_anchor  = true;
+
+    const auto sc = chord_solve_exact_setcover_oracle(
+        logits.data(), base_ids.data(), base_w.data(), T, NE, K, res_map.data(), cfg);
+    CHECK(sc.proven_exact);
+    CHECK(sc.opt_cold_union <= sc.chord_cold_union);
+    CHECK(sc.chord_cold_union <= sc.unbiased_cold_union);
+
+    // MoE-Spec at matched cold budget `sc.chord_cold_union`
+    std::vector<int32_t> ms_ids = base_ids;
+    std::vector<float>   ms_w   = base_w;
+    moespec_budget_router(logits.data(), ms_ids.data(), ms_w.data(), T, NE, K, res_map.data(), sc.chord_cold_union);
+    // Anchor t=0 stays untouched when protect_anchor=true
+    CHECK(std::memcmp(ms_ids.data(), base_ids.data(), K * sizeof(int32_t)) == 0);
+    // Surviving weights per token sum to 1.0
+    for (int t = 1; t < T; ++t) {
+        float sw = 0.0f;
+        for (int r = 0; r < K; ++r) if (ms_ids[(size_t) t * K + r] >= 0) sw += ms_w[(size_t) t * K + r];
+        CHECK(std::fabs(sw - 1.0f) < 1e-5f);
+    }
+
+    // Exact makespan oracle check under NUMA skew (85% Socket 0)
+    std::vector<HeteroQueueSpec> queues = {
+        {ExecBackendKind::PrimaryPcieDma, 0, 23.5, 3.0, 0.15, 1.0},
+        {ExecBackendKind::HelperGpuPcie,  1, 23.5, 3.0, 0.15, 1.0},
+        {ExecBackendKind::CpuNumaSocket,  0, 72.0, 1.5, 1.60, 1.65},
+        {ExecBackendKind::CpuNumaSocket,  1, 72.0, 1.5, 1.60, 1.65},
+    };
+    std::vector<MissedExpertTask> tasks;
+    for (int i = 0; i < 16; ++i) {
+        tasks.push_back({i, (i < 4) ? 3 : 1, 4718592, (i < 13) ? 0 : 1});
+    }
+    const auto mk = chord_solve_exact_makespan_oracle(tasks, queues);
+    CHECK(mk.opt_makespan_us <= mk.chord_makespan_us + 1e-6);
+    CHECK(mk.chord_makespan_us < mk.static_makespan_us);
+    CHECK(mk.chord_makespan_us < mk.fiddler_makespan_us);
+}
+
 }  // namespace
 
 int main() {
@@ -554,6 +621,7 @@ int main() {
     test_ggml_adapter_vs_s2moe_head_to_head();
     test_online_divergence_probe_and_lossless_cap();
     test_ggml_selection_logit_transform();
+    test_exact_oracles_and_moespec_dominance();
 
     if (g_fails == 0) {
         std::printf("chordmoe_test: all checks passed\n");
