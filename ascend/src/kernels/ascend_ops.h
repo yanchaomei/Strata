@@ -16,6 +16,7 @@ inline constexpr int P_ETOK = P_GSTART + P_MAXE + 8;    // 280 (multiple of 8)
 inline constexpr int P_EW = P_ETOK + P_MAXE;            // 408 (multiple of 8)
 inline constexpr int P_TOKENT = P_EW + P_MAXE;          // 536 (multiple of 8)
 inline constexpr int P_INTS = P_TOKENT + P_MAXE + 8;    // 672 (multiple of 8 = 2688 bytes)
+inline constexpr int QSA_BUDGET = 2051;
 
 void launch_f32_to_f16(void* stream, const void* src_f32, void* dst_f16, uint32_t n);
 void launch_f16_to_f32(void* stream, const void* src_f16, void* dst_f32, uint32_t n);
@@ -32,7 +33,7 @@ void launch_gr_post_down(void* stream, const void* down_f16, void* lo_f16, void*
 
 // Post-processing of [n_tok, 10240] f16 output from W_hc_up Cube matmul:
 // out[t, d] = 0.25f * sum_{c=0..3} xn_f32[t, c, d] * sigmoid(float(gate_f16[t, c, d]))
-// Writes both out_f16 [n_tok, 2560] and out_f32 [n_tok, 2560].
+// Writes out_f16 [n_tok, 2560] and optional out_f32 [n_tok, 2560] (pass nullptr to skip f32 GM write).
 void launch_gr_post_up(void* stream, const void* xn_f32, const void* gate_f16, void* out_f16, void* out_f32, uint32_t n_tok);
 
 // Fused GDN (Gated DeltaNet) recurrence step across 48 value heads (16 q/k heads, state [48, 128, 128] f32,
@@ -118,8 +119,59 @@ void launch_moe_combine_f16(void* stream, const void* ye_f16, const void* tok_pe
                             const void* wts_f32, const void* ysh_f16, void* bo_f32,
                             uint32_t n_tok, uint32_t total_rows);
 
-// Argmax over vocabulary logits_f16 [n_tok, n_vocab] -> tok_out_i32 [8] (32B aligned):
+// Argmax over vocabulary logits_f16 [n_tok, row_stride] (scanning 0..n_vocab-1) -> tok_out_i32 [8] (32B aligned):
 void launch_argmax_f16(void* stream, const void* logits_f16, void* part_val_f32, void* part_idx_i32,
-                       void* tok_out_i32, uint32_t n_tok, uint32_t n_vocab);
+                       void* tok_out_i32, uint32_t n_tok, uint32_t n_vocab, uint32_t row_stride = 0);
+
+// ---- Native DFlash2 Block Speculative Drafter Kernels (dav-m200) ----
+// 1. Target layer tap: tap_out[r, 2560] = 0.25f * (sum_c R[r,c,d] + bo[r,d] * sum_c 2*sigmoid(inj[r,c]*0.25f))
+void launch_df2_tap(void* stream, const void* R_f32, const void* bo_f32, const void* inj_f32,
+                    void* tap_out_f32, uint32_t n_tok);
+
+// 2. RMSNorm over [rows, 2560] reading x_f32 (x_is_f16==0) or x_f16 (x_is_f16!=0), writing optional y_f32 and/or y_f16,
+//    plus optional rowlog_f16 [ring_mod, 2560] at slot = pos_i32[r] % ring_mod when rowlog_f16 != nullptr:
+void launch_df2_rms(void* stream, const void* x_in, uint32_t x_is_f16, const void* w_f32,
+                    void* y_f32, void* y_f16, uint32_t rows, float eps,
+                    void* rowlog_f16 = nullptr, const void* pos_i32 = nullptr, uint32_t ring_mod = 0);
+
+// 3. Gather logged half rows from rowlog_f16 [ring_mod, 2560] at slot = pos_i32[r] % ring_mod into dst_f16 [rows, 2560]:
+void launch_df2_gather_log(void* stream, const void* rowlog_f16, const void* pos_i32,
+                           void* dst_f16, uint32_t rows, uint32_t ring_mod);
+
+// 4. Context KV ring write: unpacks kvc_f16 [rows, 2048] ([k_1024 | v_1024]), applies RMSNorm + NEOX RoPE to 8 K heads,
+//    and writes kring_f32[slot, 1024] & vring_f32[slot, 1024] at slot = pos_i32[r] % ring_mod:
+void launch_df2_kv_write(void* stream, const void* kvc_f16, const void* k_norm_f32,
+                         const void* pos_i32, const void* rope_cs_f32,
+                         void* kring_f32, void* vring_f32,
+                         uint32_t rows, uint32_t ring_mod, float eps);
+
+// 5. Grouped dynamic 2-tap convolution over [rows, 2560] (group=16, 160 groups, dyn_f16 [rows, 640]):
+//    reads x_in (f32 if x_is_f16==0 else f16), base_f32 [2, 2560], optional resid_f32 [rows, 2560], writes optional out_f32 / out_f16:
+void launch_df2_conv(void* stream, const void* x_in, uint32_t x_is_f16,
+                     const void* dyn_f16, uint32_t dyn_col_off, const void* base_f32,
+                     const void* resid_f32, void* out_f32, void* out_f16, uint32_t rows);
+
+// 6. Block QKV unpack + Q/K RMSNorm + NEOX RoPE: qkv_f16 [rows, 6144] ([q_4096 | k_1024 | v_1024])
+//    -> qn_f32 [rows, 4096], kblk_f32 [rows, 1024], vblk_f32 [rows, 1024]:
+void launch_df2_qk_prep(void* stream, const void* qkv_f16, const void* q_norm_f32, const void* k_norm_f32,
+                        const void* rope_cs_f32, void* qn_f32, void* kblk_f32, void* vblk_f32,
+                        uint32_t rows, float eps);
+
+// 7. 8-AI-Core Flash-Block attention over ring [lo_pos .. s_pos-1] (windowed) + block [0..7] (bidirectional) -> ao_f16 [8, 4096]:
+void launch_df2_attn(void* stream, const void* qn_f32, const void* kring_f32, const void* vring_f32,
+                     const void* kblk_f32, const void* vblk_f32, void* ao_f16,
+                     uint32_t s_pos, uint32_t lo_pos, uint32_t ring_mod, uint32_t window);
+
+// 8. Vectorized SwiGLU over fused gu_f16 [rows, 2 * inter] ([gate_inter | up_inter]) -> sw_f16 [rows, inter]:
+void launch_df2_swiglu_f16(void* stream, const void* gu_f16, void* sw_f16, uint32_t rows, uint32_t inter);
+
+// 9. 8-AI-Core Top-16 over FP16 logits [rows, row_stride] (scanning 0..n_cols-1) -> out_val_f32 [rows, 16], out_tok_i32 [rows, 16]:
+void launch_topk16_f16(void* stream, const void* logits_f16, void* part_val_f32, void* part_idx_i32,
+                       void* out_val_f32, void* out_tok_i32, const void* vmap_i32,
+                       uint32_t rows, uint32_t n_cols, uint32_t row_stride, uint32_t use_map);
+
+// 10. Stitch column-chunked QGM outputs [n_chunks, rows, chunk_cols] -> row-major [rows, n_chunks * chunk_cols] FP16:
+void launch_stitch_cols_f16(void* stream, const void* src_f16, void* dst_f16,
+                            uint32_t rows, uint32_t chunk_cols, uint32_t n_chunks);
 
 }  // namespace strata::ascend_ops

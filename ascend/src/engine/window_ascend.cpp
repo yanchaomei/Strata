@@ -75,6 +75,13 @@ constexpr int QSA_IN_COLS  = 13952; // 12288 + 512 + 512 + 512 + 128
 constexpr int MOE_IN_COLS  = 1808;  // 512 + 640 + 640 + 16
 constexpr int QIDS_STRIDE  = 2056;  // >= BUD(2051), multiple of 8 ints (32B)
 
+constexpr int DF2_RING    = 2064;
+constexpr int DF2_ROWS    = 8;
+constexpr int DF2_DRAFTS  = 7;
+constexpr int DF2_CTX_MAX = MAX_ROWS; // 256-row Cube batch for prompt context updates
+
+std::string g_df2_pack_path;
+
 double now_ms() {
     using Clock = std::chrono::steady_clock;
     return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
@@ -448,6 +455,16 @@ struct Int8GroupNzMat {
     }
 };
 
+// Column-chunked INT8 FRACTAL_NZ matrix for >64K vocabulary heads (avoids CANN dav-m200 uint16 byte-stride overflow at N_out > 65536!)
+struct Int8ChunkedMat {
+    static constexpr int64_t MAX_CHUNK_COLS = 62080; // 248320 / 4 = 62080 (multiple of 128, < 65536!)
+    std::vector<Int8GroupNzMat> chunks;
+    DevMem stitch_tmp; // [MAXT, total_cols] f16 scratch when M > 1 && chunks.size() > 1
+    int64_t K = 0;
+    int64_t chunk_cols = 0;
+    int64_t total_cols = 0;
+};
+
 struct LayerWeights {
     int dev = 0;
     bool is_qsa = false;
@@ -462,21 +479,21 @@ struct LayerWeights {
     NzMat  W_hc_ffn_dn;    // [10240, 336] f16 NZ
     NzMat  W_hc_ffn_up;    // [320, 10240] f16 NZ
 
-    // GDN weights (when !is_qsa)
-    NzMat  W_gdn_in;       // [2560, 16480] f16 NZ
-    NzMat  W_ssm_out;      // [6144, 2560] f16 NZ
-    DevMem ssm_conv_w;     // [10240 * 4] f32
-    DevMem ssm_dt;         // [64] f32 (first 48 used)
-    DevMem ssm_a;          // [64] f32 (first 48 used)
-    DevMem ssm_norm;       // [128] f32
+    // GDN weights (when !is_qsa): 280-TOPS INT8 FRACTAL_NZ Cube QGM(E=1)
+    Int8GroupNzMat W_gdn_in;   // [1, 16480, 2560] INT8 NZ
+    Int8GroupNzMat W_ssm_out;  // [1, 2560, 6144]  INT8 NZ
+    DevMem ssm_conv_w;         // [10240 * 4] f32
+    DevMem ssm_dt;             // [64] f32 (first 48 used)
+    DevMem ssm_a;              // [64] f32 (first 48 used)
+    DevMem ssm_norm;           // [128] f32
 
-    // QSA weights (when is_qsa)
-    NzMat  W_qsa_in;       // [2560, 13952] f16 NZ
-    NzMat  W_attn_out;     // [6144, 2560] f16 NZ
-    DevMem q_norm;         // [256] f32
-    DevMem k_norm;         // [256] f32
-    DevMem iq_norm;        // [128] f32
-    DevMem ik_norm;        // [128] f32
+    // QSA weights (when is_qsa): 280-TOPS INT8 FRACTAL_NZ Cube QGM(E=1)
+    Int8GroupNzMat W_qsa_in;   // [1, 13952, 2560] INT8 NZ
+    Int8GroupNzMat W_attn_out; // [1, 2560, 6144]  INT8 NZ
+    DevMem q_norm;             // [256] f32
+    DevMem k_norm;             // [256] f32
+    DevMem iq_norm;            // [128] f32
+    DevMem ik_norm;            // [128] f32
 
     // MoE router + shared expert
     NzMat  W_moe_in;       // [2560, 1808] f16 NZ
@@ -558,6 +575,9 @@ struct NpuCtx {
     // INT8 Cube MoE scratch (supports full MAX_ROWS * 10 = 2560 routed rows!)
     DevMem group_cumsum_i64;   // [512] i64
     aclTensor* desc_group_cumsum = nullptr;
+    DevMem d_one_m;            // [(MAX_ROWS + 1) * 4] i64: pre-staged single-group M = 1..MAX_ROWS (32B aligned per M!)
+    aclTensor* desc_one_m[MAX_ROWS + 1] = {};
+    DevMem d_tap;              // [n_taps_on_dev * MAX_ROWS * 2560] f32 (allocated lazily when DFlash2 taps are enabled)
     DevMem sorted_tok_i32;     // [MAX_ROWS * TOPK + 8] i32
     DevMem tok_perm_i32;       // [MAX_ROWS, 16] i32
     DevMem sorted_x_f16;       // [MAX_ROWS * TOPK, 2560] f16
@@ -603,7 +623,8 @@ struct NpuCtx {
         return check_acl(aclnnMm(ws.ptr, ws_need, exec, stream), "aclnnMm", err);
     }
 
-    bool qgm(const void* x_ptr, const Int8GroupNzMat& W, void* out_ptr, int64_t M, std::string& err) {
+    bool qgm_with_glist(const void* x_ptr, const Int8GroupNzMat& W, aclTensor* glist_desc,
+                        void* out_ptr, int64_t M, std::string& err) {
         if (!check_acl(aclrtSetDevice(dev), "aclrtSetDevice", err)) return false;
         int64_t xShape[2] = {M, W.K}, xStride[2] = {W.K, 1};
         int64_t oShape[2] = {M, W.N_out}, oStride[2] = {W.N_out, 1};
@@ -616,7 +637,7 @@ struct NpuCtx {
         uint64_t ws_need = 0;
         aclOpExecutor* exec = nullptr;
         if (!check_acl(aclnnQuantGroupedMatmulDequantWeightNZGetWorkspaceSize(
-                           tX, W.desc_w, W.desc_scale, desc_group_cumsum,
+                           tX, W.desc_w, W.desc_scale, glist_desc,
                            nullptr, nullptr, nullptr, nullptr, qmode, true, tO, &ws_need, &exec),
                        "aclnnQuantGroupedMatmulDequantWeightNZGetWorkspaceSize", err)) {
             return false;
@@ -629,8 +650,48 @@ struct NpuCtx {
                          "aclnnQuantGroupedMatmulDequantWeightNZ", err);
     }
 
+    bool qgm(const void* x_ptr, const Int8GroupNzMat& W, void* out_ptr, int64_t M, std::string& err) {
+        return qgm_with_glist(x_ptr, W, desc_group_cumsum, out_ptr, M, err);
+    }
+
+    bool qgm1(const void* x_ptr, const Int8GroupNzMat& W, void* out_ptr, int64_t M, std::string& err) {
+        if (M < 1 || M > MAX_ROWS) {
+            err = "ascend window: qgm1 M out of range";
+            return false;
+        }
+        return qgm_with_glist(x_ptr, W, desc_one_m[M], out_ptr, M, err);
+    }
+
+    bool qgm1_chunked(const void* x_ptr, const Int8ChunkedMat& W, void* out_ptr, int64_t M, std::string& err) {
+        const size_t nc = W.chunks.size();
+        if (nc == 1) {
+            return qgm1(x_ptr, W.chunks[0], out_ptr, M, err);
+        }
+        if (M == 1) {
+            // M == 1: chunks write directly into contiguous slices of out_ptr [1, total_cols] with zero stitch!
+            for (size_t s = 0; s < nc; ++s) {
+                uint16_t* dst = reinterpret_cast<uint16_t*>(out_ptr) + s * (size_t)W.chunk_cols;
+                if (!qgm1(x_ptr, W.chunks[s], dst, 1, err)) return false;
+            }
+            return true;
+        }
+        for (size_t s = 0; s < nc; ++s) {
+            uint16_t* dst = reinterpret_cast<uint16_t*>(W.stitch_tmp.ptr) + s * (size_t)M * (size_t)W.chunk_cols;
+            if (!qgm1(x_ptr, W.chunks[s], dst, M, err)) return false;
+        }
+        strata::ascend_ops::launch_stitch_cols_f16(
+            stream, W.stitch_tmp.ptr, out_ptr, (uint32_t)M, (uint32_t)W.chunk_cols, (uint32_t)nc);
+        return true;
+    }
+
     ~NpuCtx() {
         clear_temp_tensors();
+        for (int m = 0; m <= MAX_ROWS; ++m) {
+            if (desc_one_m[m]) {
+                aclDestroyTensor(desc_one_m[m]);
+                desc_one_m[m] = nullptr;
+            }
+        }
         if (desc_group_cumsum) {
             aclDestroyTensor(desc_group_cumsum);
             desc_group_cumsum = nullptr;
@@ -727,6 +788,125 @@ void build_fused_kn_f16(const uint8_t* base_map, int64_t K, int64_t N_total,
         }
         for (auto& th : threads) th.join();
     }
+}
+
+// Parallel 64-core packer for fused dense/draft matrices into 280-TOPS INT8 FRACTAL_NZ [1, K/32, N_out/16, 16, 32] + FP32 scale [1, N_out]
+void pack_fused_int8_nz(const uint8_t* base_map, int64_t K, int64_t N_total,
+                        const std::vector<MatSlice>& slices,
+                        std::vector<int8_t>& out_nz, std::vector<float>& out_sc, unsigned nth) {
+    out_nz.assign((size_t)K * (size_t)N_total, 0);
+    out_sc.assign((size_t)N_total, 0.0f);
+    const size_t n_blocks = (size_t)(N_total >> 4);
+    const size_t k_blocks = (size_t)(K >> 5);
+
+    for (const MatSlice& sl : slices) {
+        if (!sl.t || sl.rows <= 0) continue;
+        const size_t rb = ref::row_bytes(sl.t->type, (int)K);
+        const uint8_t* src_base = base_map + sl.t->offset;
+        const int64_t R = sl.rows;
+        const int64_t col0 = sl.col_offset;
+        const unsigned workers = std::max(1u, std::min<unsigned>(nth, (unsigned)R));
+        std::vector<std::thread> threads;
+        threads.reserve(workers);
+        for (unsigned tid = 0; tid < workers; ++tid) {
+            threads.emplace_back([&, tid] {
+                std::vector<float> row_f32((size_t)K);
+                std::vector<int8_t> row_i8((size_t)K);
+                const int64_t r0 = (R * tid) / workers;
+                const int64_t r1 = (R * (tid + 1)) / workers;
+                for (int64_t r = r0; r < r1; ++r) {
+                    ref::dequant(sl.t->type, src_base + (size_t)r * rb, row_f32.data(), (size_t)K);
+                    float mx = 0.0f;
+                    for (int64_t k = 0; k < K; ++k) mx = std::max(mx, std::fabs(row_f32[(size_t)k]));
+                    const float sc = mx > 0.0f ? (mx / 127.0f) : 1.0f;
+                    const float inv_sc = 1.0f / sc;
+                    const size_t out_r = (size_t)(col0 + r);
+                    out_sc[out_r] = sc;
+                    for (int64_t k = 0; k < K; ++k) {
+                        int q = (int)std::nearbyintf(row_f32[(size_t)k] * inv_sc);
+                        row_i8[(size_t)k] = (int8_t)(q < -127 ? -127 : (q > 127 ? 127 : q));
+                    }
+                    const size_t r_hi = out_r >> 4, r_lo = out_r & 15;
+                    for (size_t kh = 0; kh < k_blocks; ++kh) {
+                        const size_t off = (((kh * n_blocks + r_hi) * 16 + r_lo) * 32);
+                        std::memcpy(out_nz.data() + off, row_i8.data() + kh * 32, 32);
+                    }
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+    }
+}
+
+bool df2_read_index(const std::string& path, std::vector<int>& taps, std::map<std::string, gguf::Tensor>& ten,
+                    uint64_t& total, uint64_t& data_off, std::map<std::string, std::string>& cfg, std::string& err) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "dflash2: cannot open " + path; return false; }
+    struct Closer { std::FILE* f; ~Closer() { std::fclose(f); } } closer{f};
+    uint32_t hdr[3];
+    if (std::fread(hdr, 4, 3, f) != 3 || std::memcmp(hdr, "DF2P", 4) != 0 || hdr[1] != 1) {
+        err = "dflash2: " + path + " is not a DF2P v1 pack";
+        return false;
+    }
+    std::string index(hdr[2], ' ');
+    if (std::fread(index.data(), 1, hdr[2], f) != hdr[2]) {
+        err = "dflash2: the pack's index is cut short";
+        return false;
+    }
+    data_off = 12 + hdr[2];
+    total = 0;
+    for (size_t i = 0; i < index.size();) {
+        const size_t j = index.find('\n', i);
+        if (j == std::string::npos) break;
+        const std::string line = index.substr(i, j - i);
+        i = j + 1;
+        char a[256], b[64], c[256];
+        long long v1 = 0, v2 = 0, v3 = 0, v4 = 0;
+        if (std::sscanf(line.c_str(), "cfg %63s %255s", b, c) == 2) {
+            cfg[b] = c;
+            if (std::string(b) == "taps") {
+                taps.clear();
+                for (const char* q = c; *q;) {
+                    taps.push_back(std::atoi(q));
+                    while (*q && *q != ',') ++q;
+                    if (*q == ',') ++q;
+                }
+            }
+        } else if (std::sscanf(line.c_str(), "t %255s %63s %lld %lld %lld %lld", a, b, &v1, &v2, &v3, &v4) == 6) {
+            gguf::Tensor t;
+            t.name = a;
+            const std::string dt = b;
+            t.type = dt == "q8_0" ? ref::Q8_0 : dt == "q4_0" ? ref::Q4_0 : dt == "f32" ? ref::F32 : dt == "bf16" ? ref::BF16 : -1;
+            t.shape = {(uint64_t)v2, (uint64_t)v1}; // ggml order: [K_in, N_out]
+            t.offset = (uint64_t)v3;
+            t.bytes = (uint64_t)v4;
+            ten[t.name] = t;
+            total = std::max(total, t.offset + t.bytes);
+        }
+    }
+    if (ten.empty()) {
+        err = "dflash2: the pack has no tensors";
+        return false;
+    }
+    return true;
+}
+
+void df2_rope_rows(const int32_t* pos, int rows, float theta, float* table) {
+    constexpr double two_pi = 6.283185307179586476925286766559;
+    for (int r = 0; r < rows; ++r) {
+        for (int i = 0; i < 64; ++i) {
+            const double inv = std::pow((double)theta, -(double)(2 * i) / 128.0);
+            double ang = (double)pos[r] * inv;
+            ang -= two_pi * std::rint(ang / two_pi);
+            table[(r * 2 + 0) * 64 + i] = (float)std::cos(ang);
+            table[(r * 2 + 1) * 64 + i] = (float)std::sin(ang);
+        }
+    }
+}
+
+void dequant_cb_row256(int cb_type, const uint8_t* cb_base, int32_t tok_id, float* dst256) {
+    const size_t rb = ref::row_bytes(cb_type, 256);
+    ref::dequant(cb_type, cb_base + (size_t)std::max(0, tok_id) * rb, dst256, 256);
 }
 
 // Parallel 64-core Q2_0 -> INT8 FRACTAL_NZ [E, K/32, N_out/16, 16, 32] + FP32 scale [E, N_out] packer
@@ -852,6 +1032,8 @@ void split_q2_experts_down(const uint8_t* down_base, int nexp,
 
 }  // namespace
 
+std::string draft_vocab_default();
+
 class WindowAscend {
 public:
     bool ready() const { return ready_; }
@@ -916,6 +1098,9 @@ public:
         }
 
         // Initialize per-NPU streams & scratch buffers (Pass 1a)
+        std::vector<int64_t> h_one_m((size_t)(MAX_ROWS + 1) * 4, 0);
+        for (int m = 1; m <= MAX_ROWS; ++m) h_one_m[(size_t)m * 4] = (int64_t)m;
+
         npu_.resize((size_t)n_npu_);
         for (int d = 0; d < n_npu_; ++d) {
             npu_[d] = std::make_unique<NpuCtx>();
@@ -937,7 +1122,7 @@ public:
                 !c.lo_f16.alloc(d, (size_t)MAX_ROWS * LR * 2, err) ||
                 !c.gate_f16.alloc(d, (size_t)MAX_ROWS * HCD * 2, err) ||
                 !c.xa_f16.alloc(d, (size_t)MAX_ROWS * N * 2, err) ||
-                !c.xa_f32.alloc(d, (size_t)MAX_ROWS * N * 4, err) ||
+                !c.xa_f32.alloc(d, 64, err) ||
                 !c.xf_f16.alloc(d, (size_t)MAX_ROWS * N * 2, err) ||
                 !c.xf_f32.alloc(d, (size_t)MAX_ROWS * N * 4, err) ||
                 !c.gdn_in_f16.alloc(d, (size_t)MAX_ROWS * GDN_IN_COLS * 2, err) ||
@@ -955,6 +1140,8 @@ public:
                 !c.sh_h_f16.alloc(d, (size_t)MAX_ROWS * NFF * 2, err) ||
                 !c.ysh_f16.alloc(d, (size_t)MAX_ROWS * N * 2, err) ||
                 !c.group_cumsum_i64.alloc(d, 512 * 8, err) ||
+                !c.d_one_m.alloc(d, h_one_m.size() * sizeof(int64_t), err, false) ||
+                !c.d_one_m.upload(h_one_m.data(), h_one_m.size() * sizeof(int64_t), err) ||
                 !c.sorted_tok_i32.alloc(d, (size_t)(MAX_ROWS * TOPK + 8) * 4, err) ||
                 !c.tok_perm_i32.alloc(d, (size_t)MAX_ROWS * 16 * 4, err) ||
                 !c.sorted_x_f16.alloc(d, (size_t)MAX_ROWS * TOPK * N * 2, err) ||
@@ -972,6 +1159,16 @@ public:
             if (!c.desc_group_cumsum) {
                 err = "ascend window: aclCreateTensor(group_cumsum) failed";
                 return false;
+            }
+            int64_t oneDim[1] = {1}, oneStr[1] = {1};
+            for (int m = 1; m <= MAX_ROWS; ++m) {
+                c.desc_one_m[m] = aclCreateTensor(
+                    oneDim, 1, ACL_INT64, oneStr, 0, ACL_FORMAT_ND, oneDim, 1,
+                    reinterpret_cast<int64_t*>(c.d_one_m.ptr) + (size_t)m * 4);
+                if (!c.desc_one_m[m]) {
+                    err = "ascend window: aclCreateTensor(desc_one_m) failed";
+                    return false;
+                }
             }
         }
 
@@ -1034,6 +1231,25 @@ public:
             }
             err.clear();
             return true;
+        };
+
+        std::vector<int8_t> h_i8_nz;
+        std::vector<float>  h_i8_sc;
+        auto load_int8_mat = [&](int dev, const std::string& key, int64_t K_in, int64_t N_cols,
+                                 const std::vector<MatSlice>& slices, Int8GroupNzMat& mat) -> bool {
+            const size_t nz_sz = (size_t)K_in * (size_t)N_cols;
+            const size_t sc_sz = (size_t)N_cols * sizeof(float);
+            h_i8_nz.resize(nz_sz);
+            h_i8_sc.resize((size_t)N_cols);
+            if (!cache.load_blob(key + ".nz8", h_i8_nz.data(), nz_sz) ||
+                !cache.load_blob(key + ".sc",  h_i8_sc.data(), sc_sz)) {
+                pack_fused_int8_nz(map_base, K_in, N_cols, slices, h_i8_nz, h_i8_sc, nth);
+                if (cache.has_space_for(nz_sz + sc_sz)) {
+                    cache.save_blob(key + ".nz8", h_i8_nz.data(), nz_sz);
+                    cache.save_blob(key + ".sc",  h_i8_sc.data(), sc_sz);
+                }
+            }
+            return mat.upload_prepacked(dev, h_i8_nz.data(), h_i8_sc.data(), 1, N_cols, K_in, err);
         };
 
         // PLE setup on NPU 0
@@ -1099,13 +1315,13 @@ public:
 
             if (!lw.is_qsa) {
                 const int gi = l - l / QI;
-                if (!load_nz_mat(dev, pfx + "gdn_in.nz16", N, GDN_IN_COLS,
-                                 {{f_.find(b + "attn_qkv.weight"),  0,             CONV},
-                                  {f_.find(b + "attn_gate.weight"), CONV,          ZV},
-                                  {f_.find(b + "ssm_alpha.weight"), CONV + ZV,     HV},
-                                  {f_.find(b + "ssm_beta.weight"),  CONV + ZV + HV, HV}}, lw.W_gdn_in) ||
-                    !load_nz_mat(dev, pfx + "ssm_out.nz16", ZV, N,
-                                 {{f_.find(b + "ssm_out.weight"), 0, N}}, lw.W_ssm_out)) return false;
+                if (!load_int8_mat(dev, pfx + "gdn_in", N, GDN_IN_COLS,
+                                   {{f_.find(b + "attn_qkv.weight"),  0,             CONV},
+                                    {f_.find(b + "attn_gate.weight"), CONV,          ZV},
+                                    {f_.find(b + "ssm_alpha.weight"), CONV + ZV,     HV},
+                                    {f_.find(b + "ssm_beta.weight"),  CONV + ZV + HV, HV}}, lw.W_gdn_in) ||
+                    !load_int8_mat(dev, pfx + "ssm_out", ZV, N,
+                                   {{f_.find(b + "ssm_out.weight"), 0, N}}, lw.W_ssm_out)) return false;
 
                 if (!upload_f32_dev(dev, b + "ssm_conv1d.weight", CONV * 4, lw.ssm_conv_w) ||
                     !upload_f32_dev(dev, b + "ssm_dt.bias", 64, lw.ssm_dt) ||
@@ -1122,14 +1338,14 @@ public:
                     !gs.ab_save.alloc(dev, (size_t)MAXT * 96 * 4, err)) return false;
             } else {
                 const int qi = l / QI;
-                if (!load_nz_mat(dev, pfx + "qsa_in.nz16", N, QSA_IN_COLS,
-                                 {{f_.find(b + "attn_q.weight"),         0,                    QFULL},
-                                  {f_.find(b + "attn_k.weight"),         QFULL,                KV},
-                                  {f_.find(b + "attn_v.weight"),         QFULL + KV,           KV},
-                                  {f_.find(b + "indexer.q_proj.weight"), QFULL + 2 * KV,       IQR},
-                                  {f_.find(b + "indexer.k_proj.weight"), QFULL + 2 * KV + IQR, ID}}, lw.W_qsa_in) ||
-                    !load_nz_mat(dev, pfx + "attn_out.nz16", QOUT, N,
-                                 {{f_.find(b + "attn_output.weight"), 0, N}}, lw.W_attn_out)) return false;
+                if (!load_int8_mat(dev, pfx + "qsa_in", N, QSA_IN_COLS,
+                                   {{f_.find(b + "attn_q.weight"),         0,                    QFULL},
+                                    {f_.find(b + "attn_k.weight"),         QFULL,                KV},
+                                    {f_.find(b + "attn_v.weight"),         QFULL + KV,           KV},
+                                    {f_.find(b + "indexer.q_proj.weight"), QFULL + 2 * KV,       IQR},
+                                    {f_.find(b + "indexer.k_proj.weight"), QFULL + 2 * KV + IQR, ID}}, lw.W_qsa_in) ||
+                    !load_int8_mat(dev, pfx + "attn_out", QOUT, N,
+                                   {{f_.find(b + "attn_output.weight"), 0, N}}, lw.W_attn_out)) return false;
 
                 if (!upload_f32_dev(dev, b + "attn_q_norm.weight", QD, lw.q_norm) ||
                     !upload_f32_dev(dev, b + "attn_k_norm.weight", QD, lw.k_norm) ||
@@ -1156,12 +1372,36 @@ public:
                              {{f_.find(b + "ffn_down_shexp.weight"), 0, N}}, lw.W_shexp_down)) return false;
         }
 
-        // Output HC + LM Head on final NPU before Pass 2
+        // Output HC + 280-TOPS INT8 Cube Chunked LM Head on final NPU before Pass 2
         const int last_dev = n_npu_ - 1;
+        df2_dev_ = std::min(1, n_npu_ - 1);
+        {
+            const int64_t n_ch = (n_vocab_ + Int8ChunkedMat::MAX_CHUNK_COLS - 1) / Int8ChunkedMat::MAX_CHUNK_COLS;
+            const int64_t ch_cols = (((n_vocab_ + n_ch - 1) / n_ch + 127) / 128) * 128;
+            vocab_pad_ = n_ch * ch_cols;
+            W_lm_head_.K = N;
+            W_lm_head_.chunk_cols = ch_cols;
+            W_lm_head_.total_cols = vocab_pad_;
+            W_lm_head_.chunks.resize((size_t)n_ch);
+            const size_t rb = ref::row_bytes(t_out->type, N);
+            for (int64_t s = 0; s < n_ch; ++s) {
+                const int64_t r0 = s * ch_cols;
+                const int64_t rows = std::max<int64_t>(0, std::min<int64_t>(ch_cols, n_vocab_ - r0));
+                gguf::Tensor sub = *t_out;
+                sub.offset = t_out->offset + (size_t)r0 * rb;
+                sub.shape = {(uint64_t)N, (uint64_t)rows};
+                if (!load_int8_mat(last_dev, "lm_head_c" + std::to_string(s) + "_" + std::to_string(ch_cols),
+                                   N, ch_cols, {{&sub, 0, rows}}, W_lm_head_.chunks[(size_t)s])) {
+                    return false;
+                }
+            }
+            if (n_ch > 1 && !W_lm_head_.stitch_tmp.alloc(last_dev, (size_t)MAXT * (size_t)vocab_pad_ * 2, err, false)) {
+                return false;
+            }
+        }
         if (!upload_f32_dev(last_dev, "output_hc_norm.weight", HCD, out_hc_norm_) ||
             !load_nz_mat(last_dev, "out_hc_dn.nz16", HCD, W_HC_DN_COLS, {{f_.find("output_hc_down.weight"), 0, LR}}, W_out_hc_dn_) ||
             !load_nz_mat(last_dev, "out_hc_up.nz16", LR, HCD, {{f_.find("output_hc_up.weight"), 0, HCD}}, W_out_hc_up_) ||
-            !load_nz_mat(last_dev, "lm_head.nz16", N, vocab_pad_, {{t_out, 0, n_vocab_}}, W_lm_head_, 0xFBFFu) ||
             !d_lm_f16_.alloc(last_dev, (size_t)MAXT * vocab_pad_ * 2, err) ||
             !d_lm_f32_.alloc(last_dev, (size_t)MAXT * vocab_pad_ * 4, err) ||
             !d_arg_pv_.alloc(last_dev, (size_t)MAXT * 64 * 4, err) ||
@@ -1169,20 +1409,22 @@ public:
             !d_tok_out_.alloc(last_dev, 8 * 4, err)) {
             return false;
         }
-        h_kn.clear();
-        h_kn.shrink_to_fit();
+        h_kn = {};
+        h_i8_nz = {};
+        h_i8_sc = {};
 
-        std::fprintf(stderr, "strata ascend: Pass 1/2 dense + states + LM head ready in %.1f s; starting Pass 2/2 MoE expert packing...\n",
+        std::fprintf(stderr, "strata ascend: Pass 1/2 dense(INT8+FP16) + states + LM head ready in %.1f s; starting Pass 2/2 MoE expert packing...\n",
                      (now_ms() - t0) / 1000.0);
         std::fflush(stderr);
 
         // Pass 2: Auto-fill HBM on every NPU with 280-TOPS INT8 FRACTAL_NZ Cube MoE experts!
         const bool force_q2 = std::getenv("STRATA_ASCEND_FORCE_Q2") && std::string(std::getenv("STRATA_ASCEND_FORCE_Q2")) == "1";
-        size_t hbm_reserve = 1050ULL << 20; // ~1.03 GiB headroom (packs 45/48 INT8 Cube layers on 3x48GB 310P3 with self-healing Q2_0 fallback)
+        size_t hbm_reserve = 320ULL << 20; // 320 MiB runtime headroom (packs 48/48 INT8 Cube solo or 47/48 + DFlash2 on 3x48GB 310P3)
         if (const char* er = std::getenv("STRATA_ASCEND_HBM_RESERVE_MIB")) {
             int mib = std::atoi(er);
             if (mib >= 64) hbm_reserve = (size_t)mib << 20;
         }
+        const size_t df2_hbm_reserve = !g_df2_pack_path.empty() ? (1080ULL << 20) : 0ULL;
 
         const size_t w1_nz_bytes = (size_t)nexp_ * (size_t)(2 * NFF) * (size_t)N;
         const size_t w1_sc_bytes = (size_t)nexp_ * (size_t)(2 * NFF) * sizeof(float);
@@ -1216,7 +1458,8 @@ public:
             size_t free_b = 0, total_b = 0;
             (void)aclrtSetDevice(dev);
             (void)aclrtGetMemInfo(ACL_HBM_MEM, &free_b, &total_b);
-            const size_t min_for_int8 = int8_layer_bytes + (size_t)(rem - 1) * q2_layer_bytes + hbm_reserve;
+            const size_t extra_df2 = (dev == df2_dev_) ? df2_hbm_reserve : 0ULL;
+            const size_t min_for_int8 = int8_layer_bytes + (size_t)(rem - 1) * q2_layer_bytes + hbm_reserve + extra_df2;
             lw.use_int8_cube = (!force_q2 && free_b >= min_for_int8);
 
             if (lw.use_int8_cube) {
@@ -1310,27 +1553,37 @@ public:
         return true;
     }
 
-    bool fold_pending(std::string& err) {
-        if (pend_fold_ <= 0) return true;
-        const int nf = pend_fold_;
-        const int src_hp = 1 - hp_;  // hp_ already flipped when commit() scheduled pend_fold_
-        for (int l = 0; l < NL; ++l) {
-            if (l % QI == QI - 1) continue;
-            const int gi = l - l / QI;
-            const LayerWeights& lw = layers_[(size_t)l];
-            GdnState& gs = gdn_states_[(size_t)gi];
-            NpuCtx& nc = *npu_[lw.dev];
-            if (!check_acl(aclrtSetDevice(lw.dev), "aclrtSetDevice", err)) return false;
-            strata::ascend_ops::launch_gdn_step(
-                nc.stream, gs.state.ptr, gs.hist[src_hp].ptr, gs.hist[1 - src_hp].ptr,
-                nc.gdn_in_f16.ptr, gs.qkv_save.ptr, gs.z_save.ptr, gs.ab_save.ptr,
-                lw.ssm_conv_w.ptr, lw.ssm_dt.ptr, lw.ssm_a.ptr, lw.ssm_norm.ptr,
-                nc.yg_f16.ptr, (uint32_t)nf, (uint32_t)nf, /*from_saved=*/1u, eps_);
-        }
+    bool fold_pending(std::string& err, bool wait_sync = false, int skip_dev = -1) {
+        bool any = false;
         for (int d = 0; d < n_npu_; ++d) {
-            if (!npu_[d]->sync(err)) return false;
+            if (d != skip_dev && pend_fold_dev_[d] > 0) any = true;
         }
-        pend_fold_ = 0;
+        if (any) {
+            const int src_hp = pend_fold_hp_;
+            for (int l = 0; l < NL; ++l) {
+                if (l % QI == QI - 1) continue;
+                const LayerWeights& lw = layers_[(size_t)l];
+                if (lw.dev == skip_dev || pend_fold_dev_[lw.dev] <= 0) continue;
+                const int nf = pend_fold_dev_[lw.dev];
+                const int gi = l - l / QI;
+                GdnState& gs = gdn_states_[(size_t)gi];
+                NpuCtx& nc = *npu_[lw.dev];
+                if (!check_acl(aclrtSetDevice(lw.dev), "aclrtSetDevice", err)) return false;
+                strata::ascend_ops::launch_gdn_step(
+                    nc.stream, gs.state.ptr, gs.hist[src_hp].ptr, gs.hist[1 - src_hp].ptr,
+                    nc.gdn_in_f16.ptr, gs.qkv_save.ptr, gs.z_save.ptr, gs.ab_save.ptr,
+                    lw.ssm_conv_w.ptr, lw.ssm_dt.ptr, lw.ssm_a.ptr, lw.ssm_norm.ptr,
+                    nc.yg_f16.ptr, (uint32_t)nf, (uint32_t)nf, /*from_saved=*/1u, eps_);
+            }
+            for (int d = 0; d < n_npu_; ++d) {
+                if (d != skip_dev) pend_fold_dev_[d] = 0;
+            }
+        }
+        if (wait_sync) {
+            for (int d = 0; d < n_npu_; ++d) {
+                if (d != skip_dev && !npu_[d]->sync(err)) return false;
+            }
+        }
         return true;
     }
 
@@ -1381,6 +1634,7 @@ public:
 
         int cur_inj = 0;
         const uint32_t gdn_commit = (immediate_commit || Tn == 1) ? (uint32_t)Tn : 0u;
+        const bool want_taps = taps_on_ && (head || (tap_cb_ && pos0 + Tn > tap_first_));
 
         for (int l = 0; l < NL; ++l) {
             const LayerWeights& lw = layers_[(size_t)l];
@@ -1413,14 +1667,14 @@ public:
                 nc.stream, nc.hc_dn_f16.ptr, nc.lo_f16.ptr, nc.inj[1 - cur_inj].ptr, (uint32_t)Tn);
             if (!nc.mm(nc.lo_f16.ptr, lw.W_hc_attn_up, nc.gate_f16.ptr, Tn, err)) return false;
             strata::ascend_ops::launch_gr_post_up(
-                nc.stream, nc.xn_f32.ptr, nc.gate_f16.ptr, nc.xa_f16.ptr, nc.xa_f32.ptr, (uint32_t)Tn);
+                nc.stream, nc.xn_f32.ptr, nc.gate_f16.ptr, nc.xa_f16.ptr, /*out_f32=*/nullptr, (uint32_t)Tn);
             cur_inj = 1 - cur_inj;
 
-            // ---- Mixer: GDN or QSA ----
+            // ---- Mixer: GDN or QSA (280-TOPS INT8 FRACTAL_NZ Cube QGM(E=1)) ----
             if (!lw.is_qsa) {
                 const int gi = l - l / QI;
                 GdnState& gs = gdn_states_[(size_t)gi];
-                if (!nc.mm(nc.xa_f16.ptr, lw.W_gdn_in, nc.gdn_in_f16.ptr, Tn, err)) return false;
+                if (!nc.qgm1(nc.xa_f16.ptr, lw.W_gdn_in, nc.gdn_in_f16.ptr, Tn, err)) return false;
                 strata::ascend_ops::launch_gdn_step(
                     nc.stream, gs.state.ptr, gs.hist[hp_].ptr, gs.hist[1 - hp_].ptr,
                     nc.gdn_in_f16.ptr,
@@ -1429,11 +1683,11 @@ public:
                     gdn_commit == 0 ? gs.ab_save.ptr  : nullptr,
                     lw.ssm_conv_w.ptr, lw.ssm_dt.ptr, lw.ssm_a.ptr, lw.ssm_norm.ptr,
                     nc.yg_f16.ptr, (uint32_t)Tn, gdn_commit, /*from_saved=*/0u, eps_);
-                if (!nc.mm(nc.yg_f16.ptr, lw.W_ssm_out, nc.bo_f16.ptr, Tn, err)) return false;
+                if (!nc.qgm1(nc.yg_f16.ptr, lw.W_ssm_out, nc.bo_f16.ptr, Tn, err)) return false;
             } else {
                 const int qi = l / QI;
                 QsaLayerState& qs = qsa_states_[(size_t)qi];
-                if (!nc.mm(nc.xa_f16.ptr, lw.W_qsa_in, nc.qsa_in_f16.ptr, Tn, err)) return false;
+                if (!nc.qgm1(nc.xa_f16.ptr, lw.W_qsa_in, nc.qsa_in_f16.ptr, Tn, err)) return false;
                 strata::ascend_ops::launch_qsa_prep(
                     nc.stream, nc.qsa_in_f16.ptr,
                     lw.q_norm.ptr, lw.k_norm.ptr, lw.iq_norm.ptr, lw.ik_norm.ptr,
@@ -1442,16 +1696,18 @@ public:
                     qs.kq.ptr, qs.vq.ptr, qs.ksc.ptr, qs.vsc.ptr,
                     qs.tail.ptr, qs.dead.ptr, qs.pooled.ptr,
                     (uint32_t)pos0, 0u, (uint32_t)Tn, eps_);
-                strata::ascend_ops::launch_qsa_select(
-                    nc.stream, nc.qidx_f32.ptr, qs.pooled.ptr, qs.dead.ptr,
-                    nc.scores_f32.ptr, nc.qids_i32.ptr,
-                    (uint32_t)pos0, (uint32_t)max_blocks_, (uint32_t)Tn);
+                if (Tn > MAXT || pos0 + Tn > strata::ascend_ops::QSA_BUDGET) {
+                    strata::ascend_ops::launch_qsa_select(
+                        nc.stream, nc.qidx_f32.ptr, qs.pooled.ptr, qs.dead.ptr,
+                        nc.scores_f32.ptr, nc.qids_i32.ptr,
+                        (uint32_t)pos0, (uint32_t)max_blocks_, (uint32_t)Tn);
+                }
                 strata::ascend_ops::launch_qsa_attn_merge(
                     nc.stream, nc.qcur_f32.ptr, nc.qgate_f32.ptr,
                     qs.kq.ptr, qs.vq.ptr, qs.ksc.ptr, qs.vsc.ptr,
                     nc.qids_i32.ptr, nc.xq_f16.ptr,
                     (uint32_t)pos0, (uint32_t)Tn);
-                if (!nc.mm(nc.xq_f16.ptr, lw.W_attn_out, nc.bo_f16.ptr, Tn, err)) return false;
+                if (!nc.qgm1(nc.xq_f16.ptr, lw.W_attn_out, nc.bo_f16.ptr, Tn, err)) return false;
             }
 
             // ---- FFN Hyper-Connection Read (apply=2u fuses bo_f16 -> f32 directly in UB!) ----
@@ -1463,7 +1719,8 @@ public:
                 nc.stream, nc.hc_dn_f16.ptr, nc.lo_f16.ptr, nc.inj[1 - cur_inj].ptr, (uint32_t)Tn);
             if (!nc.mm(nc.lo_f16.ptr, lw.W_hc_ffn_up, nc.gate_f16.ptr, Tn, err)) return false;
             strata::ascend_ops::launch_gr_post_up(
-                nc.stream, nc.xn_f32.ptr, nc.gate_f16.ptr, nc.xf_f16.ptr, nc.xf_f32.ptr, (uint32_t)Tn);
+                nc.stream, nc.xn_f32.ptr, nc.gate_f16.ptr, nc.xf_f16.ptr,
+                lw.use_int8_cube ? nullptr : nc.xf_f32.ptr, (uint32_t)Tn);
             cur_inj = 1 - cur_inj;
 
             // ---- MoE Sublayer ----
@@ -1507,6 +1764,13 @@ public:
                 }
             }
 
+            // ---- DFlash2 Tap Extraction (mean of completed HC streams after tapped layer) ----
+            if (want_taps && tap_slot_[l] >= 0) {
+                float* dst_slot = reinterpret_cast<float*>(nc.d_tap.ptr) + (size_t)tap_dev_slot_[l] * MAX_ROWS * N;
+                strata::ascend_ops::launch_df2_tap(
+                    nc.stream, nc.R.ptr, nc.bo_f32.ptr, nc.inj[cur_inj].ptr, dst_slot, (uint32_t)Tn);
+            }
+
             // ---- PLE Block after Layer 0 ----
             if (l == 0 && ple_on_) {
                 strata::ascend_ops::launch_gr_norm(
@@ -1520,7 +1784,7 @@ public:
             }
         }
 
-        // 3) Final Hyper-Connection + LM Head on final NPU
+        // 3) Final Hyper-Connection + 280-TOPS INT8 Cube LM Head on final NPU
         const int last_dev = n_npu_ - 1;
         NpuCtx& lc = *npu_[last_dev];
         if (!check_acl(aclrtSetDevice(last_dev), "aclrtSetDevice(last)", err)) return false;
@@ -1534,16 +1798,38 @@ public:
                 lc.stream, lc.hc_dn_f16.ptr, lc.lo_f16.ptr, lc.inj[1 - cur_inj].ptr, (uint32_t)Tn);
             if (!lc.mm(lc.lo_f16.ptr, W_out_hc_up_, lc.gate_f16.ptr, Tn, err)) return false;
             strata::ascend_ops::launch_gr_post_up(
-                lc.stream, lc.xn_f32.ptr, lc.gate_f16.ptr, lc.xa_f16.ptr, lc.xa_f32.ptr, (uint32_t)Tn);
+                lc.stream, lc.xn_f32.ptr, lc.gate_f16.ptr, lc.xa_f16.ptr, /*out_f32=*/nullptr, (uint32_t)Tn);
 
-            if (!lc.mm(lc.xa_f16.ptr, W_lm_head_, d_lm_f16_.ptr, Tn, err)) return false;
+            if (!lc.qgm1_chunked(lc.xa_f16.ptr, W_lm_head_, d_lm_f16_.ptr, Tn, err)) return false;
             strata::ascend_ops::launch_argmax_f16(
                 lc.stream, d_lm_f16_.ptr, d_arg_pv_.ptr, d_arg_pi_.ptr, d_tok_out_.ptr,
-                (uint32_t)Tn, (uint32_t)vocab_pad_);
+                (uint32_t)Tn, (uint32_t)n_vocab_, (uint32_t)vocab_pad_);
         }
 
         for (int d = 0; d < n_npu_; ++d) {
             if (!npu_[d]->sync(err)) return false;
+        }
+
+        if (want_taps) {
+            const size_t nt = tap_layers_.size();
+            const size_t slot_bytes = (size_t)Tn * N * sizeof(float);
+            for (size_t ti = 0; ti < nt; ++ti) {
+                const int td = tap_dev_of_[ti];
+                const int ls = tap_dev_local_[ti];
+                if (!check_acl(aclrtSetDevice(td), "aclrtSetDevice(tap)", err)) return false;
+                const void* src_ptr = reinterpret_cast<const uint8_t*>(npu_[td]->d_tap.ptr) + (size_t)ls * MAX_ROWS * N * sizeof(float);
+                if (!check_acl(aclrtMemcpy(h_tap_raw_.data() + ti * MAX_ROWS * N, slot_bytes, src_ptr, slot_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
+                               "aclrtMemcpy(tap D2H)", err)) {
+                    return false;
+                }
+            }
+            float* dst_tap = head ? h_tap_dec_.data() : h_tap_pro_.data();
+            for (int t = 0; t < Tn; ++t) {
+                float* row_dst = dst_tap + (size_t)t * nt * N;
+                for (size_t ti = 0; ti < nt; ++ti) {
+                    std::memcpy(row_dst + ti * N, h_tap_raw_.data() + (ti * MAX_ROWS + (size_t)t) * N, (size_t)N * sizeof(float));
+                }
+            }
         }
 
         if (head) {
@@ -1574,8 +1860,12 @@ public:
             return false;
         }
         if (last_T_ > 1) {
-            pend_fold_ = n_keep;
+            pend_fold_hp_ = hp_;
             hp_ = 1 - hp_;
+            for (int d = 0; d < n_npu_; ++d) pend_fold_dev_[d] = n_keep;
+            // Overlap GDN fold on non-DFlash2 NPUs (e.g. NPU 0 & NPU 2) concurrently with DFlash2::propose on df2_dev_!
+            const int skip_dev = (df2_ && df2_->bound) ? df2_dev_ : -1;
+            if (!fold_pending(err, /*wait_sync=*/false, skip_dev)) return false;
         }
         return advance_ple_and_tokens(n_keep);
     }
@@ -1623,15 +1913,17 @@ public:
             for (int i = 0; i < k; ++i) tk[(size_t)i] = (int32_t)tokens[c + i];
             const float* const* er = embd_rows ? (embd_rows + c) : nullptr;
             if (!run_forward(k, tk.data(), pos0 + c, er, /*head=*/false, /*immediate_commit=*/true, nullptr, err)) return false;
+            if (!tap_deliver(k, pos0 + c, err)) return false;
             if (on_chunk && !on_chunk(nullptr, k, pos0 + c, err)) return false;
         }
         return true;
     }
 
     void reset() {
-        pend_fold_ = 0;
+        std::memset(pend_fold_dev_, 0, sizeof(pend_fold_dev_));
         last_T_ = 0;
         std::string err;
+        for (int d = 0; d < n_npu_; ++d) (void)npu_[d]->sync(err);
         for (auto& gs : gdn_states_) {
             (void)gs.state.zero_fill(err);
             (void)gs.hist[0].zero_fill(err);
@@ -1645,7 +1937,7 @@ public:
     }
 
     bool checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& err) {
-        if (!fold_pending(err)) return false;
+        if (!fold_pending(err, /*wait_sync=*/true)) return false;
         const size_t gs_b = (size_t)HV * SS * SS * 4;
         const size_t hs_b = (size_t)CONV * 3 * 4; // Strata shared contract: 3 active conv taps per channel
         c.gdn.resize(gdn_states_.size() * (gs_b + hs_b));
@@ -1685,8 +1977,9 @@ public:
             err = "ascend window: checkpoint size mismatch";
             return false;
         }
-        pend_fold_ = 0;
+        std::memset(pend_fold_dev_, 0, sizeof(pend_fold_dev_));
         last_T_ = 0;
+        for (int d = 0; d < n_npu_; ++d) (void)npu_[d]->sync(err);
         std::vector<float> h4((size_t)CONV * 4, 0.0f);
         for (size_t i = 0; i < gdn_states_.size(); ++i) {
             const uint8_t* src = c.gdn.data() + i * (gs_b + hs_b);
@@ -1706,6 +1999,728 @@ public:
             std::memcpy(t4.data(), c.tails.data() + j * ts_b, ts_b);
             if (!qsa_states_[j].tail.upload(t4.data(), t4.size() * 4, err) ||
                 !qsa_states_[j].dead.upload(c.dead.data() + j * ds_b, ds_b, err)) return false;
+        }
+        return true;
+    }
+
+    // ---- Native DFlash2 Tap & Block Drafter Support on Ascend 310P3 ----
+    bool taps_enable(const std::vector<int>& layers, std::string& err) {
+        if (taps_on_) {
+            if (layers != tap_layers_) {
+                err = "ascend taps: already enabled for different layers";
+                return false;
+            }
+            return true;
+        }
+        if (layers.empty()) {
+            err = "ascend taps: empty layer list";
+            return false;
+        }
+        for (int i = 0; i < 64; ++i) {
+            tap_slot_[i] = -1;
+            tap_dev_slot_[i] = -1;
+        }
+        std::vector<int> dev_cnt((size_t)n_npu_, 0);
+        tap_dev_of_.resize(layers.size());
+        tap_dev_local_.resize(layers.size());
+        for (size_t i = 0; i < layers.size(); ++i) {
+            const int l = layers[i];
+            if (l < 0 || l >= NL - 1) {
+                err = "ascend taps: layer " + std::to_string(l) + " out of range";
+                return false;
+            }
+            const int d = layers_[(size_t)l].dev;
+            const int ls = dev_cnt[(size_t)d]++;
+            tap_slot_[l] = (int)i;
+            tap_dev_slot_[l] = ls;
+            tap_dev_of_[i] = d;
+            tap_dev_local_[i] = ls;
+        }
+        for (int d = 0; d < n_npu_; ++d) {
+            if (dev_cnt[(size_t)d] > 0) {
+                if (!npu_[d]->d_tap.alloc(d, (size_t)dev_cnt[(size_t)d] * MAX_ROWS * N * sizeof(float), err)) {
+                    return false;
+                }
+            }
+        }
+        if (!h_tap_raw_.alloc(layers.size() * MAX_ROWS * N) ||
+            !h_tap_dec_.alloc((size_t)MAXT * layers.size() * N) ||
+            !h_tap_pro_.alloc((size_t)MAX_ROWS * layers.size() * N)) {
+            err = "ascend taps: host pinned staging allocation failed";
+            return false;
+        }
+        tap_layers_ = layers;
+        taps_on_ = true;
+        std::fprintf(stderr, "strata ascend: DFlash2 taps enabled (%zu layers)\n", layers.size());
+        return true;
+    }
+
+    void taps_set_cb(int64_t first_pos, const std::function<bool(const float*, int64_t, int64_t, std::string&)>& cb) {
+        tap_first_ = first_pos;
+        tap_cb_ = cb;
+    }
+
+    const float* tap_dec_ptr() const { return h_tap_dec_.data(); }
+
+    bool tap_deliver(int rows, int64_t pos0, std::string& err) {
+        if (!taps_on_ || !tap_cb_) return true;
+        const int64_t t0 = std::max<int64_t>(0, tap_first_ - pos0);
+        if (t0 >= rows) return true;
+        const size_t nt = tap_layers_.size();
+        return tap_cb_(h_tap_pro_.data() + (size_t)t0 * nt * N, rows - t0, pos0 + t0, err);
+    }
+
+    struct Df2Layer {
+        DevMem in_norm;       // [2560] f32
+        DevMem post_norm;     // [2560] f32
+        DevMem q_norm;        // [128] f32
+        DevMem k_norm;        // [128] f32
+        DevMem attn_base;     // [4 * 2560] f32
+        DevMem mlp_base;      // [4 * 2560] f32
+        NzMat  W_attn_conv;   // [2560, 640] f16 NZ
+        NzMat  W_mlp_conv;    // [2560, 640] f16 NZ
+        Int8GroupNzMat W_kv;  // [1, 2048, 2560] INT8 NZ ([k_1024 | v_1024])
+        Int8GroupNzMat W_qkv; // [1, 6144, 2560] INT8 NZ ([q_4096 | k_1024 | v_1024])
+        Int8GroupNzMat W_o;   // [1, 2560, 4096] INT8 NZ
+        Int8GroupNzMat W_gu;  // [1, 15360, 2560] INT8 NZ ([gate_7680 | up_7680])
+        Int8GroupNzMat W_down;// [1, 2560, 7680] INT8 NZ
+    };
+
+    struct Df2Ascend {
+        std::string path;
+        int dev = 0;
+        int L = 5, NH = 32, NKV = 8, I = 7680, window = 2048, group = 16, rank = 256, mask_token = 0;
+        float theta = 10000.0f, eps = 1e-6f;
+        std::vector<int> taps;
+        std::map<std::string, gguf::Tensor> ten;
+        uint64_t data_off = 0, total = 0, pack_file_bytes = 0;
+
+        int ndraft = DF2_DRAFTS;
+        int64_t floor = 0;
+        int64_t nd = 0, nd_pad = 0;
+        bool use_map = false;
+        bool bound = false;
+        uint64_t vram_bytes = 0;
+        double gpu_ms = 0.0;
+        int64_t rounds = 0;
+
+        Int8GroupNzMat W_fc;        // [1, 2560, 12800] INT8 NZ
+        DevMem hidden_norm;         // [2560] f32
+        DevMem final_norm;          // [2560] f32
+        std::vector<Df2Layer> layers;
+        Int8ChunkedMat W_dhead;     // column-chunked [1, nd_pad, 2560] INT8 NZ (<= 62080 cols per chunk!)
+        DevMem d_vmap;              // [((nd + 7)/8)*8] i32
+        NzMat  W_sel_proj;          // [2560, 256] f16 NZ
+
+        int pred_cb_type = -1, succ_cb_type = -1;
+        std::vector<uint8_t> pred_cb_raw, succ_cb_raw;
+        std::vector<float> mask_emb;
+
+        // KV ring + lineage rowlog
+        DevMem kring[8], vring[8];
+        DevMem rowlog;              // [DF2_RING, 2560] f16
+        struct Stash {
+            std::vector<int32_t> hist;
+            int64_t hi = 0, floor = 0;
+            uint64_t used = 0;
+            std::vector<uint16_t> host_log; // kept in Host DDR4 RAM (0 MB HBM!)
+        };
+        std::vector<Stash> stash;
+        uint64_t stash_tick = 0;
+        int stash_max = 4;
+
+        // Context & Block NPU scratch
+        DevMem d_taps_f32, d_taps_f16, d_fcy_f16, d_hctx_f16, d_kvc_f16, d_ctx_pos, d_ctx_rope;
+        DevMem d_h_f32, d_xn_f32, d_xn_f16, d_xc_f16, d_dyn_f16, d_qkv_f16;
+        DevMem d_qn_f32, d_kblk_f32, d_vblk_f32, d_blk_rope;
+        DevMem d_ao_f16, d_o_f16, d_gu_f16, d_sw_f16, d_mlp_f16, d_fn_f16;
+        DevMem d_logits_f16, d_tk_pv, d_tk_pi, d_topval, d_toptok, d_hsel_f16;
+
+        HostPinned<int32_t>  h_ctx_pos, h_toptok;
+        HostPinned<float>    h_ctx_rope, h_blk_h, h_blk_rope, h_topval;
+        HostPinned<uint16_t> h_hsel;
+    };
+
+    int df2_dev() const { return df2_dev_; }
+    uint64_t df2_bytes() const { return df2_ ? df2_->vram_bytes : 0; }
+    double df2_gpu_ms() const { return df2_ ? df2_->gpu_ms : 0.0; }
+    void df2_set_cap(int n) { if (df2_) df2_->ndraft = std::max(1, std::min(n, DF2_DRAFTS)); }
+    void df2_set_floor(int64_t pos) { if (df2_) df2_->floor = pos; }
+    int64_t df2_floor() const { return df2_ ? df2_->floor : 0; }
+
+    bool df2_ensure(const std::string& path, std::string& err) {
+        if (df2_) return true;
+        auto d = std::make_unique<Df2Ascend>();
+        d->path = path;
+        d->dev = df2_dev_;
+        std::map<std::string, std::string> cfg;
+        if (!df2_read_index(path, d->taps, d->ten, d->total, d->data_off, cfg, err)) return false;
+        struct stat st{};
+        if (::stat(path.c_str(), &st) == 0) d->pack_file_bytes = (uint64_t)st.st_size;
+        auto geti = [&](const char* k, int def) { auto it = cfg.find(k); return it == cfg.end() ? def : std::atoi(it->second.c_str()); };
+        d->L = geti("layers", 5); d->NH = geti("heads", 32); d->NKV = geti("kv_heads", 8); d->I = geti("inter", 7680);
+        d->window = geti("window", 2048); d->group = geti("conv_group", 16); d->rank = geti("rank", 256);
+        d->mask_token = geti("mask_token", 0);
+        if (cfg.count("rope_theta")) d->theta = (float)std::atof(cfg["rope_theta"].c_str());
+        if (cfg.count("eps")) d->eps = (float)std::atof(cfg["eps"].c_str());
+        if (geti("hidden", 0) != N || d->NH != 32 || d->NKV != 8 || geti("head_dim", 0) != 128 || d->rank != 256 ||
+            d->L != 5 || d->window + 16 > DF2_RING || d->I != 7680 || d->group != 16 || d->taps.empty()) {
+            err = "dflash2: unsupported DF2P geometry for Qwen3.8-Flash-Next";
+            return false;
+        }
+        df2_ = std::move(d);
+        return true;
+    }
+
+    bool df2_bind(const std::string& vocab_file, std::string& err) {
+        if (!df2_) { err = "dflash2: pack not opened"; return false; }
+        Df2Ascend& d = *df2_;
+        if (d.bound) return true;
+        if (!taps_on_) { err = "dflash2: target window taps are not enabled"; return false; }
+
+        unpin_all_cpus();
+        const double t0 = now_ms();
+        const unsigned nth = std::max(1u, std::min(64u, std::thread::hardware_concurrency()));
+        const int dev = d.dev;
+        NpuCtx& dc = *npu_[dev];
+
+        size_t free_before = 0, total_hbm = 0;
+        (void)aclrtSetDevice(dev);
+        (void)aclrtGetMemInfo(ACL_HBM_MEM, &free_before, &total_hbm);
+
+        // Mmap DF2P pack file for parallel 64-core packing
+        int pfd = ::open(d.path.c_str(), O_RDONLY);
+        if (pfd < 0) { err = "dflash2: cannot open " + d.path; return false; }
+        struct stat pst{};
+        if (::fstat(pfd, &pst) != 0 || (uint64_t)pst.st_size < d.data_off + d.total) {
+            ::close(pfd);
+            err = "dflash2: pack file truncated";
+            return false;
+        }
+        void* pmap = ::mmap(nullptr, (size_t)pst.st_size, PROT_READ, MAP_PRIVATE, pfd, 0);
+        ::close(pfd);
+        if (pmap == MAP_FAILED) { err = "dflash2: mmap failed on " + d.path; return false; }
+        struct Unmapper { void* p; size_t sz; ~Unmapper() { if (p != MAP_FAILED) ::munmap(p, sz); } } unmap{pmap, (size_t)pst.st_size};
+        const uint8_t* pack_data = reinterpret_cast<const uint8_t*>(pmap) + d.data_off;
+
+        CacheStore cache;
+        cache.init(f_.file_bytes, nexp_);
+        const std::string cpfx = "df2_" + std::to_string(d.pack_file_bytes) + "_";
+
+        auto find_pt = [&](const std::string& name) -> const gguf::Tensor* {
+            auto it = d.ten.find(name);
+            return it == d.ten.end() ? nullptr : &it->second;
+        };
+
+        auto upload_pack_f32 = [&](const std::string& name, size_t expect_ne, DevMem& dm) -> bool {
+            const gguf::Tensor* t = find_pt(name);
+            if (!t) { err = "dflash2: missing tensor " + name; return false; }
+            uint64_t ne = 1;
+            for (uint64_t s : t->shape) ne *= s;
+            std::vector<float> tmp(std::max<size_t>(expect_ne, (size_t)ne), 0.0f);
+            ref::dequant(t->type, pack_data + t->offset, tmp.data(), (size_t)ne);
+            return dm.alloc(dev, tmp.size() * 4, err, false) && dm.upload(tmp.data(), tmp.size() * 4, err);
+        };
+
+        std::vector<uint16_t> h_kn;
+        auto upload_pack_nz16 = [&](const std::string& key, int64_t K_in, int64_t N_cols,
+                                    const std::vector<MatSlice>& slices, NzMat& mat) -> bool {
+            const size_t sz = (size_t)K_in * (size_t)N_cols * sizeof(uint16_t);
+            h_kn.resize((size_t)K_in * (size_t)N_cols);
+            if (cache.load_blob(cpfx + key + ".nz16", h_kn.data(), sz)) {
+                return mat.upload_cached_nz(dev, h_kn.data(), K_in, N_cols, err);
+            }
+            build_fused_kn_f16(pack_data, K_in, N_cols, slices, h_kn, nth);
+            if (!mat.upload_and_format(dev, dc.stream, dc.ws.ptr, dc.ws.bytes, h_kn.data(), K_in, N_cols, err)) return false;
+            if (cache.has_space_for(sz) && mat.mem.download(h_kn.data(), sz, err)) {
+                cache.save_blob(cpfx + key + ".nz16", h_kn.data(), sz);
+            }
+            err.clear();
+            return true;
+        };
+
+        std::vector<int8_t> h_nz8;
+        std::vector<float>  h_sc;
+        auto upload_pack_int8 = [&](const std::string& key, int64_t K_in, int64_t N_cols,
+                                    const std::vector<MatSlice>& slices, Int8GroupNzMat& mat) -> bool {
+            const size_t nz_sz = (size_t)K_in * (size_t)N_cols;
+            const size_t sc_sz = (size_t)N_cols * sizeof(float);
+            h_nz8.resize(nz_sz);
+            h_sc.resize((size_t)N_cols);
+            if (!cache.load_blob(cpfx + key + ".nz8", h_nz8.data(), nz_sz) ||
+                !cache.load_blob(cpfx + key + ".sc",  h_sc.data(),  sc_sz)) {
+                pack_fused_int8_nz(pack_data, K_in, N_cols, slices, h_nz8, h_sc, nth);
+                if (cache.has_space_for(nz_sz + sc_sz)) {
+                    cache.save_blob(cpfx + key + ".nz8", h_nz8.data(), nz_sz);
+                    cache.save_blob(cpfx + key + ".sc",  h_sc.data(),  sc_sz);
+                }
+            }
+            return mat.upload_prepacked(dev, h_nz8.data(), h_sc.data(), 1, N_cols, K_in, err);
+        };
+
+        const int64_t tap_dim = (int64_t)d.taps.size() * N;
+        if (!upload_pack_int8("fc", tap_dim, N, {{find_pt("fc.weight"), 0, N}}, d.W_fc) ||
+            !upload_pack_f32("hidden_norm.weight", N, d.hidden_norm) ||
+            !upload_pack_f32("norm.weight", N, d.final_norm)) {
+            return false;
+        }
+
+        d.layers.resize((size_t)d.L);
+        for (int l = 0; l < d.L; ++l) {
+            Df2Layer& dl = d.layers[(size_t)l];
+            const std::string p = "layers." + std::to_string(l) + ".";
+            const std::string k = "l" + std::to_string(l) + "_";
+            if (!upload_pack_f32(p + "input_layernorm.weight", N, dl.in_norm) ||
+                !upload_pack_f32(p + "post_attention_layernorm.weight", N, dl.post_norm) ||
+                !upload_pack_f32(p + "self_attn.q_norm.weight", 128, dl.q_norm) ||
+                !upload_pack_f32(p + "self_attn.k_norm.weight", 128, dl.k_norm) ||
+                !upload_pack_f32(p + "attention_conv.base_kernel", 4 * N, dl.attn_base) ||
+                !upload_pack_f32(p + "mlp_conv.base_kernel", 4 * N, dl.mlp_base)) {
+                return false;
+            }
+            if (!upload_pack_nz16(k + "aconv", N, 640, {{find_pt(p + "attention_conv.kernel_projection.weight"), 0, 640}}, dl.W_attn_conv) ||
+                !upload_pack_nz16(k + "mconv", N, 640, {{find_pt(p + "mlp_conv.kernel_projection.weight"), 0, 640}}, dl.W_mlp_conv)) {
+                return false;
+            }
+            if (!upload_pack_int8(k + "kv", N, 2048,
+                                  {{find_pt(p + "self_attn.k_proj.weight"), 0,    1024},
+                                   {find_pt(p + "self_attn.v_proj.weight"), 1024, 1024}}, dl.W_kv) ||
+                !upload_pack_int8(k + "qkv", N, 6144,
+                                  {{find_pt(p + "self_attn.q_proj.weight"), 0,    4096},
+                                   {find_pt(p + "self_attn.k_proj.weight"), 4096, 1024},
+                                   {find_pt(p + "self_attn.v_proj.weight"), 5120, 1024}}, dl.W_qkv) ||
+                !upload_pack_int8(k + "o", 4096, N, {{find_pt(p + "self_attn.o_proj.weight"), 0, N}}, dl.W_o) ||
+                !upload_pack_int8(k + "gu", N, 2 * d.I,
+                                  {{find_pt(p + "mlp.gate_proj.weight"), 0,   d.I},
+                                   {find_pt(p + "mlp.up_proj.weight"),   d.I, d.I}}, dl.W_gu) ||
+                !upload_pack_int8(k + "down", d.I, N, {{find_pt(p + "mlp.down_proj.weight"), 0, N}}, dl.W_down)) {
+                return false;
+            }
+        }
+
+        if (!upload_pack_nz16("sel_proj", N, d.rank, {{find_pt("candidate_selector.hidden_projection.weight"), 0, d.rank}}, d.W_sel_proj)) {
+            return false;
+        }
+
+        // Load selector codebooks into Host DDR4 RAM (saves ~72 MiB NPU HBM!)
+        const gguf::Tensor* t_pred = find_pt("candidate_selector.predecessor_codebook");
+        const gguf::Tensor* t_succ = find_pt("candidate_selector.successor_codebook");
+        if (!t_pred || !t_succ) { err = "dflash2: missing selector codebooks"; return false; }
+        d.pred_cb_type = t_pred->type;
+        d.succ_cb_type = t_succ->type;
+        d.pred_cb_raw.assign(pack_data + t_pred->offset, pack_data + t_pred->offset + t_pred->bytes);
+        d.succ_cb_raw.assign(pack_data + t_succ->offset, pack_data + t_succ->offset + t_succ->bytes);
+        if (d.pred_cb_type == ref::Q4_0) {
+            std::fprintf(stderr, "strata ascend: DFlash2 selector codebooks: Q4_0 rows (in Host DDR4 RAM)\n");
+        }
+
+        // Load draft vocabulary list & pack INT8 FRACTAL_NZ draft head from target's output.weight
+        std::vector<int32_t> vocab;
+        const bool native_head = strata::core::Dflash2Drafter::head_native() || vocab_file == "full";
+        if (!native_head) {
+            auto try_load_vocab = [&](const std::string& p) {
+                if (p.empty() || p == "full" || !vocab.empty()) return;
+                if (std::FILE* vf = std::fopen(p.c_str(), "rb")) {
+                    int32_t id = 0;
+                    while (std::fread(&id, 4, 1, vf) == 1) {
+                        if (id >= 0 && id < n_vocab_) vocab.push_back(id);
+                    }
+                    std::fclose(vf);
+                }
+            };
+            try_load_vocab(vocab_file);
+            try_load_vocab(draft_vocab_default());
+            try_load_vocab("data/draft_vocab.bin");
+        }
+        d.nd = vocab.empty() ? n_vocab_ : (int64_t)vocab.size();
+        const int64_t dh_nch = (d.nd + Int8ChunkedMat::MAX_CHUNK_COLS - 1) / Int8ChunkedMat::MAX_CHUNK_COLS;
+        const int64_t dh_ch_cols = (((d.nd + dh_nch - 1) / dh_nch + 127) / 128) * 128;
+        d.nd_pad = dh_nch * dh_ch_cols;
+        d.use_map = !vocab.empty();
+
+        const size_t vmap_aligned = (((size_t)d.nd + 7) / 8) * 8;
+        std::vector<int32_t> h_vmap(std::max<size_t>(8, vmap_aligned), 0);
+        if (!vocab.empty()) std::memcpy(h_vmap.data(), vocab.data(), vocab.size() * sizeof(int32_t));
+        if (!d.d_vmap.alloc(dev, h_vmap.size() * sizeof(int32_t), err, false) ||
+            !d.d_vmap.upload(h_vmap.data(), h_vmap.size() * sizeof(int32_t), err)) {
+            return false;
+        }
+
+        {
+            const gguf::Tensor* t_out = f_.find("output.weight");
+            const uint8_t* out_base = reinterpret_cast<const uint8_t*>(f_.map) + t_out->offset;
+            const size_t rb = ref::row_bytes(t_out->type, N);
+            d.W_dhead.K = N;
+            d.W_dhead.chunk_cols = dh_ch_cols;
+            d.W_dhead.total_cols = d.nd_pad;
+            d.W_dhead.chunks.resize((size_t)dh_nch);
+
+            for (int64_t s = 0; s < dh_nch; ++s) {
+                const int64_t r0 = s * dh_ch_cols;
+                const int64_t rows = std::max<int64_t>(0, std::min<int64_t>(dh_ch_cols, d.nd - r0));
+                const size_t nz_sz = (size_t)N * (size_t)dh_ch_cols;
+                const size_t sc_sz = (size_t)dh_ch_cols * sizeof(float);
+                const std::string hkey = "df2_dhead_" + std::to_string(d.nd) + "_c" + std::to_string(s) + "_" + std::to_string(dh_ch_cols);
+                h_nz8.assign(nz_sz, 0);
+                h_sc.assign((size_t)dh_ch_cols, 0.0f);
+
+                if (!cache.load_blob(hkey + ".nz8", h_nz8.data(), nz_sz) ||
+                    !cache.load_blob(hkey + ".sc",  h_sc.data(),  sc_sz)) {
+                    const size_t n_blocks = (size_t)(dh_ch_cols >> 4);
+                    const size_t k_blocks = (size_t)(N >> 5);
+                    if (rows > 0) {
+                        const unsigned workers = std::max(1u, std::min<unsigned>(nth, (unsigned)rows));
+                        std::vector<std::thread> threads;
+                        threads.reserve(workers);
+                        for (unsigned tid = 0; tid < workers; ++tid) {
+                            threads.emplace_back([&, tid] {
+                                std::vector<float> row_f32((size_t)N);
+                                std::vector<int8_t> row_i8((size_t)N);
+                                const int64_t i0 = (rows * tid) / workers;
+                                const int64_t i1 = (rows * (tid + 1)) / workers;
+                                for (int64_t i = i0; i < i1; ++i) {
+                                    const int64_t g_idx = r0 + i;
+                                    const int64_t tok = vocab.empty() ? g_idx : (int64_t)vocab[(size_t)g_idx];
+                                    ref::dequant(t_out->type, out_base + (size_t)tok * rb, row_f32.data(), N);
+                                    float mx = 0.0f;
+                                    for (int k = 0; k < N; ++k) mx = std::max(mx, std::fabs(row_f32[(size_t)k]));
+                                    const float sc = mx > 0.0f ? (mx / 127.0f) : 1.0f;
+                                    const float inv_sc = 1.0f / sc;
+                                    h_sc[(size_t)i] = sc;
+                                    for (int k = 0; k < N; ++k) {
+                                        int q = (int)std::nearbyintf(row_f32[(size_t)k] * inv_sc);
+                                        row_i8[(size_t)k] = (int8_t)(q < -127 ? -127 : (q > 127 ? 127 : q));
+                                    }
+                                    const size_t r_hi = (size_t)i >> 4, r_lo = (size_t)i & 15;
+                                    for (size_t kh = 0; kh < k_blocks; ++kh) {
+                                        const size_t off = (((kh * n_blocks + r_hi) * 16 + r_lo) * 32);
+                                        std::memcpy(h_nz8.data() + off, row_i8.data() + kh * 32, 32);
+                                    }
+                                }
+                            });
+                        }
+                        for (auto& th : threads) th.join();
+                    }
+                    if (cache.has_space_for(nz_sz + sc_sz)) {
+                        cache.save_blob(hkey + ".nz8", h_nz8.data(), nz_sz);
+                        cache.save_blob(hkey + ".sc",  h_sc.data(),  sc_sz);
+                    }
+                }
+                if (!d.W_dhead.chunks[(size_t)s].upload_prepacked(dev, h_nz8.data(), h_sc.data(), 1, dh_ch_cols, N, err)) return false;
+            }
+            if (dh_nch > 1 && !d.W_dhead.stitch_tmp.alloc(dev, (size_t)DF2_ROWS * (size_t)d.nd_pad * 2, err, false)) {
+                return false;
+            }
+        }
+        h_kn = {}; h_nz8 = {}; h_sc = {};
+
+        // Mask token embedding from pre-dequantized h_tok_embd_f32_
+        const int64_t mt = std::max<int64_t>(0, std::min<int64_t>(n_vocab_ - 1, d.mask_token));
+        d.mask_emb.assign(h_tok_embd_f32_.data() + (size_t)mt * N, h_tok_embd_f32_.data() + (size_t)(mt + 1) * N);
+
+        // Allocate KV ring, rowlog, and scratch on df2_dev_
+        for (int l = 0; l < d.L; ++l) {
+            if (!d.kring[l].alloc(dev, (size_t)DF2_RING * 1024 * 4, err) ||
+                !d.vring[l].alloc(dev, (size_t)DF2_RING * 1024 * 4, err)) return false;
+        }
+        if (!d.rowlog.alloc(dev, (size_t)DF2_RING * N * 2, err) ||
+            !d.d_taps_f32.alloc(dev, (size_t)DF2_CTX_MAX * tap_dim * 4, err, false) ||
+            !d.d_taps_f16.alloc(dev, (size_t)DF2_CTX_MAX * tap_dim * 2, err, false) ||
+            !d.d_fcy_f16.alloc(dev, (size_t)DF2_CTX_MAX * N * 2, err, false) ||
+            !d.d_hctx_f16.alloc(dev, (size_t)DF2_CTX_MAX * N * 2, err, false) ||
+            !d.d_kvc_f16.alloc(dev, (size_t)DF2_CTX_MAX * 2048 * 2, err, false) ||
+            !d.d_ctx_pos.alloc(dev, (size_t)DF2_CTX_MAX * 4, err) ||
+            !d.d_ctx_rope.alloc(dev, (size_t)DF2_CTX_MAX * 128 * 4, err, false) ||
+            !d.d_h_f32.alloc(dev, (size_t)DF2_ROWS * N * 4, err, false) ||
+            !d.d_xn_f32.alloc(dev, (size_t)DF2_ROWS * N * 4, err, false) ||
+            !d.d_xn_f16.alloc(dev, (size_t)DF2_ROWS * N * 2, err, false) ||
+            !d.d_xc_f16.alloc(dev, (size_t)DF2_ROWS * N * 2, err, false) ||
+            !d.d_dyn_f16.alloc(dev, (size_t)DF2_ROWS * 640 * 2, err, false) ||
+            !d.d_qkv_f16.alloc(dev, (size_t)DF2_ROWS * 6144 * 2, err, false) ||
+            !d.d_qn_f32.alloc(dev, (size_t)DF2_ROWS * 4096 * 4, err, false) ||
+            !d.d_kblk_f32.alloc(dev, (size_t)DF2_ROWS * 1024 * 4, err, false) ||
+            !d.d_vblk_f32.alloc(dev, (size_t)DF2_ROWS * 1024 * 4, err, false) ||
+            !d.d_blk_rope.alloc(dev, (size_t)DF2_ROWS * 128 * 4, err, false) ||
+            !d.d_ao_f16.alloc(dev, (size_t)DF2_ROWS * 4096 * 2, err, false) ||
+            !d.d_o_f16.alloc(dev, (size_t)DF2_ROWS * N * 2, err, false) ||
+            !d.d_gu_f16.alloc(dev, (size_t)DF2_ROWS * 2 * d.I * 2, err, false) ||
+            !d.d_sw_f16.alloc(dev, (size_t)DF2_ROWS * d.I * 2, err, false) ||
+            !d.d_mlp_f16.alloc(dev, (size_t)DF2_ROWS * N * 2, err, false) ||
+            !d.d_fn_f16.alloc(dev, (size_t)DF2_ROWS * N * 2, err, false) ||
+            !d.d_logits_f16.alloc(dev, (size_t)DF2_ROWS * (size_t)d.nd_pad * 2, err) ||
+            !d.d_tk_pv.alloc(dev, (size_t)DF2_ROWS * 8 * 16 * 4, err) ||
+            !d.d_tk_pi.alloc(dev, (size_t)DF2_ROWS * 8 * 16 * 4, err) ||
+            !d.d_topval.alloc(dev, (size_t)DF2_ROWS * 16 * 4, err) ||
+            !d.d_toptok.alloc(dev, (size_t)DF2_ROWS * 16 * 4, err) ||
+            !d.d_hsel_f16.alloc(dev, (size_t)DF2_ROWS * 256 * 2, err)) {
+            return false;
+        }
+
+        if (!d.h_ctx_pos.alloc(DF2_CTX_MAX) ||
+            !d.h_ctx_rope.alloc((size_t)DF2_CTX_MAX * 128) ||
+            !d.h_blk_h.alloc((size_t)DF2_ROWS * N) ||
+            !d.h_blk_rope.alloc((size_t)DF2_ROWS * 128) ||
+            !d.h_topval.alloc((size_t)DF2_ROWS * 16) ||
+            !d.h_toptok.alloc((size_t)DF2_ROWS * 16) ||
+            !d.h_hsel.alloc((size_t)DF2_ROWS * 256)) {
+            err = "dflash2: failed to allocate pinned host buffers";
+            return false;
+        }
+
+        pin_host_thread_numa1();
+
+        size_t free_after = 0;
+        (void)aclrtSetDevice(dev);
+        (void)aclrtGetMemInfo(ACL_HBM_MEM, &free_after, &total_hbm);
+        d.vram_bytes = free_before > free_after ? (free_before - free_after) : 0;
+        d.bound = true;
+        std::fprintf(stderr, "strata ascend: DFlash2 ready on NPU %d (%.0f MiB HBM, %.2f GiB free, %lld-token INT8 Cube draft head) in %.1f s\n",
+                     dev, (double)d.vram_bytes / 1048576.0, (double)free_after / 1073741824.0, (long long)d.nd, (now_ms() - t0) / 1000.0);
+        std::fflush(stderr);
+        return true;
+    }
+
+    bool df2_prepare(std::string& err) {
+        if (!df2_ || !df2_->bound) { err = "dflash2: not bound"; return false; }
+        return true;
+    }
+
+    bool df2_enqueue_ctx_batch(int m, const float* host_taps, int64_t pos0, std::string& err) {
+        Df2Ascend& d = *df2_;
+        NpuCtx& dc = *npu_[d.dev];
+        const size_t tap_dim = d.taps.size() * N;
+        const int m_pos_aligned = ((m + 7) / 8) * 8;
+        for (int i = 0; i < m_pos_aligned; ++i) {
+            d.h_ctx_pos[(size_t)i] = (int32_t)(pos0 + std::min(i, m - 1));
+        }
+        df2_rope_rows(d.h_ctx_pos.data(), m, d.theta, d.h_ctx_rope.data());
+
+        if (!d.d_taps_f32.upload(host_taps, (size_t)m * tap_dim * 4, err) ||
+            !d.d_ctx_pos.upload(d.h_ctx_pos.data(), (size_t)m_pos_aligned * 4, err) ||
+            !d.d_ctx_rope.upload(d.h_ctx_rope.data(), (size_t)m * 128 * 4, err)) {
+            return false;
+        }
+        if (!check_acl(aclrtSetDevice(d.dev), "aclrtSetDevice(df2_ctx)", err)) return false;
+        strata::ascend_ops::launch_f32_to_f16(dc.stream, d.d_taps_f32.ptr, d.d_taps_f16.ptr, (uint32_t)((size_t)m * tap_dim));
+        if (!dc.qgm1(d.d_taps_f16.ptr, d.W_fc, d.d_fcy_f16.ptr, m, err)) return false;
+        strata::ascend_ops::launch_df2_rms(
+            dc.stream, d.d_fcy_f16.ptr, /*x_is_f16=*/1u, d.hidden_norm.ptr,
+            /*y_f32=*/nullptr, d.d_hctx_f16.ptr, (uint32_t)m, d.eps,
+            d.rowlog.ptr, d.d_ctx_pos.ptr, (uint32_t)DF2_RING);
+
+        for (int l = 0; l < d.L; ++l) {
+            Df2Layer& dl = d.layers[(size_t)l];
+            if (!dc.qgm1(d.d_hctx_f16.ptr, dl.W_kv, d.d_kvc_f16.ptr, m, err)) return false;
+            strata::ascend_ops::launch_df2_kv_write(
+                dc.stream, d.d_kvc_f16.ptr, dl.k_norm.ptr, d.d_ctx_pos.ptr, d.d_ctx_rope.ptr,
+                d.kring[l].ptr, d.vring[l].ptr, (uint32_t)m, (uint32_t)DF2_RING, d.eps);
+        }
+        return true;
+    }
+
+    bool df2_context_ptr(const float* taps, int64_t n, int64_t pos0, std::string& err) {
+        if (!df2_ || !df2_->bound) { err = "dflash2: not bound"; return false; }
+        Df2Ascend& d = *df2_;
+        NpuCtx& dc = *npu_[d.dev];
+        const size_t tap_dim = d.taps.size() * N;
+        for (int64_t b0 = 0; b0 < n; b0 += DF2_CTX_MAX) {
+            const int m = (int)std::min<int64_t>(DF2_CTX_MAX, n - b0);
+            if (!df2_enqueue_ctx_batch(m, taps + (size_t)b0 * tap_dim, pos0 + b0, err)) return false;
+            if (!dc.sync(err)) return false;
+        }
+        return true;
+    }
+
+    int64_t df2_restore_lineage(const std::vector<int32_t>& cur_hist, int64_t cur_hi, const int32_t* ids, int64_t resume, std::string& err) {
+        if (!df2_ || !df2_->bound || df2_->stash_max <= 0 || resume <= 0) return 0;
+        Df2Ascend& d = *df2_;
+        NpuCtx& dc = *npu_[d.dev];
+        const size_t log_elems = (size_t)DF2_RING * N;
+        if (cur_hi > 0 && !cur_hist.empty()) {
+            Df2Ascend::Stash s;
+            s.hist = cur_hist; s.hi = cur_hi; s.floor = d.floor; s.used = ++d.stash_tick;
+            s.host_log.resize(log_elems);
+            if (d.rowlog.download(s.host_log.data(), log_elems * 2, err)) {
+                d.stash.push_back(std::move(s));
+            }
+            err.clear();
+        }
+        const int64_t lo = std::max<int64_t>(0, resume - (d.window - 1));
+        int best = -1;
+        for (size_t i = 0; i < d.stash.size(); ++i) {
+            const auto& s = d.stash[i];
+            if (s.hi + 256 < resume || (int64_t)s.hist.size() < resume || s.hi - DF2_RING > lo) continue;
+            int64_t k = 0;
+            while (k < resume && s.hist[(size_t)k] == ids[k]) ++k;
+            if (k < resume) continue;
+            if (best < 0 || s.used > d.stash[(size_t)best].used) best = (int)i;
+        }
+        Df2Ascend::Stash match;
+        if (best >= 0) {
+            match = std::move(d.stash[(size_t)best]);
+            d.stash.erase(d.stash.begin() + best);
+        }
+        while ((int)d.stash.size() > d.stash_max) {
+            size_t old = 0;
+            for (size_t i = 1; i < d.stash.size(); ++i) if (d.stash[i].used < d.stash[old].used) old = i;
+            d.stash.erase(d.stash.begin() + old);
+        }
+        if (best < 0) return 0;
+        if (!d.rowlog.upload(match.host_log.data(), log_elems * 2, err)) return 0;
+
+        const int64_t r_end = std::min<int64_t>(resume, match.hi);
+        const int64_t from = std::max<int64_t>(lo, match.floor);
+        if (from >= r_end) return 0;
+
+        for (int64_t b0 = from; b0 < r_end; b0 += DF2_CTX_MAX) {
+            const int m = (int)std::min<int64_t>(DF2_CTX_MAX, r_end - b0);
+            const int m_pos_aligned = ((m + 7) / 8) * 8;
+            for (int i = 0; i < m_pos_aligned; ++i) d.h_ctx_pos[(size_t)i] = (int32_t)(b0 + std::min(i, m - 1));
+            df2_rope_rows(d.h_ctx_pos.data(), m, d.theta, d.h_ctx_rope.data());
+            if (!d.d_ctx_pos.upload(d.h_ctx_pos.data(), (size_t)m_pos_aligned * 4, err) ||
+                !d.d_ctx_rope.upload(d.h_ctx_rope.data(), (size_t)m * 128 * 4, err)) return 0;
+            if (!check_acl(aclrtSetDevice(d.dev), "aclrtSetDevice(df2_rebuild)", err)) return 0;
+            strata::ascend_ops::launch_df2_gather_log(dc.stream, d.rowlog.ptr, d.d_ctx_pos.ptr, d.d_hctx_f16.ptr, (uint32_t)m, (uint32_t)DF2_RING);
+            for (int l = 0; l < d.L; ++l) {
+                Df2Layer& dl = d.layers[(size_t)l];
+                if (!dc.qgm1(d.d_hctx_f16.ptr, dl.W_kv, d.d_kvc_f16.ptr, m, err)) return 0;
+                strata::ascend_ops::launch_df2_kv_write(
+                    dc.stream, d.d_kvc_f16.ptr, dl.k_norm.ptr, d.d_ctx_pos.ptr, d.d_ctx_rope.ptr,
+                    d.kring[l].ptr, d.vring[l].ptr, (uint32_t)m, (uint32_t)DF2_RING, d.eps);
+            }
+            if (!dc.sync(err)) return 0;
+        }
+        d.floor = from;
+        return r_end - from;
+    }
+
+    bool df2_draft(const float* taps, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err) {
+        if (!df2_ || !df2_->bound) { err = "dflash2: not bound"; return false; }
+        if (n_new < 1 || n_new > DF2_ROWS) { err = "dflash2: draft n_new out of range"; return false; }
+        Df2Ascend& d = *df2_;
+        NpuCtx& dc = *npu_[d.dev];
+        const double t0 = now_ms();
+
+        const float* src_taps = taps ? taps : h_tap_dec_.data();
+        if (!df2_enqueue_ctx_batch(n_new, src_taps, pos0, err)) return false;
+
+        // Stage block embeddings (anchor + 7 mask tokens) and block RoPE table for positions s .. s + 7
+        const int64_t s = pos0 + n_new;
+        int32_t bpos[DF2_ROWS];
+        for (int i = 0; i < DF2_ROWS; ++i) bpos[i] = (int32_t)(s + i);
+        df2_rope_rows(bpos, DF2_ROWS, d.theta, d.h_blk_rope.data());
+
+        const int64_t anc_id = std::max<int64_t>(0, std::min<int64_t>(n_vocab_ - 1, anchor));
+        std::memcpy(d.h_blk_h.data(), h_tok_embd_f32_.data() + (size_t)anc_id * N, (size_t)N * 4);
+        for (int i = 1; i < DF2_ROWS; ++i) {
+            std::memcpy(d.h_blk_h.data() + (size_t)i * N, d.mask_emb.data(), (size_t)N * 4);
+        }
+        if (!d.d_h_f32.upload(d.h_blk_h.data(), (size_t)DF2_ROWS * N * 4, err) ||
+            !d.d_blk_rope.upload(d.h_blk_rope.data(), (size_t)DF2_ROWS * 128 * 4, err)) {
+            return false;
+        }
+
+        const int64_t lo = std::min<int64_t>(s, std::max<int64_t>(std::max<int64_t>(0, s - (d.window - 1)), d.floor));
+
+        // Enqueue 5-layer bidirectional block transformer on dc.stream (back-to-back with context update!)
+        for (int l = 0; l < d.L; ++l) {
+            Df2Layer& dl = d.layers[(size_t)l];
+            const float* base_a = reinterpret_cast<const float*>(dl.attn_base.ptr);
+            const float* base_m = reinterpret_cast<const float*>(dl.mlp_base.ptr);
+
+            strata::ascend_ops::launch_df2_rms(
+                dc.stream, d.d_h_f32.ptr, /*x_is_f16=*/0u, dl.in_norm.ptr,
+                d.d_xn_f32.ptr, d.d_xn_f16.ptr, DF2_ROWS, d.eps);
+            if (!dc.mm(d.d_xn_f16.ptr, dl.W_attn_conv, d.d_dyn_f16.ptr, DF2_ROWS, err)) return false;
+            strata::ascend_ops::launch_df2_conv(
+                dc.stream, d.d_xn_f32.ptr, /*x_is_f16=*/0u, d.d_dyn_f16.ptr, /*dyn_col_off=*/0u,
+                base_a, /*resid=*/nullptr, /*out_f32=*/nullptr, d.d_xc_f16.ptr, DF2_ROWS);
+            if (!dc.qgm1(d.d_xc_f16.ptr, dl.W_qkv, d.d_qkv_f16.ptr, DF2_ROWS, err)) return false;
+            strata::ascend_ops::launch_df2_qk_prep(
+                dc.stream, d.d_qkv_f16.ptr, dl.q_norm.ptr, dl.k_norm.ptr, d.d_blk_rope.ptr,
+                d.d_qn_f32.ptr, d.d_kblk_f32.ptr, d.d_vblk_f32.ptr, DF2_ROWS, d.eps);
+            strata::ascend_ops::launch_df2_attn(
+                dc.stream, d.d_qn_f32.ptr, d.kring[l].ptr, d.vring[l].ptr,
+                d.d_kblk_f32.ptr, d.d_vblk_f32.ptr, d.d_ao_f16.ptr,
+                (uint32_t)s, (uint32_t)lo, (uint32_t)DF2_RING, (uint32_t)d.window);
+            if (!dc.qgm1(d.d_ao_f16.ptr, dl.W_o, d.d_o_f16.ptr, DF2_ROWS, err)) return false;
+            strata::ascend_ops::launch_df2_conv(
+                dc.stream, d.d_o_f16.ptr, /*x_is_f16=*/1u, d.d_dyn_f16.ptr, /*dyn_col_off=*/320u,
+                base_a + 2 * N, d.d_h_f32.ptr, d.d_h_f32.ptr, /*out_f16=*/nullptr, DF2_ROWS);
+
+            strata::ascend_ops::launch_df2_rms(
+                dc.stream, d.d_h_f32.ptr, /*x_is_f16=*/0u, dl.post_norm.ptr,
+                d.d_xn_f32.ptr, d.d_xn_f16.ptr, DF2_ROWS, d.eps);
+            if (!dc.mm(d.d_xn_f16.ptr, dl.W_mlp_conv, d.d_dyn_f16.ptr, DF2_ROWS, err)) return false;
+            strata::ascend_ops::launch_df2_conv(
+                dc.stream, d.d_xn_f32.ptr, /*x_is_f16=*/0u, d.d_dyn_f16.ptr, /*dyn_col_off=*/0u,
+                base_m, /*resid=*/nullptr, /*out_f32=*/nullptr, d.d_xc_f16.ptr, DF2_ROWS);
+            if (!dc.qgm1(d.d_xc_f16.ptr, dl.W_gu, d.d_gu_f16.ptr, DF2_ROWS, err)) return false;
+            strata::ascend_ops::launch_df2_swiglu_f16(dc.stream, d.d_gu_f16.ptr, d.d_sw_f16.ptr, DF2_ROWS, (uint32_t)d.I);
+            if (!dc.qgm1(d.d_sw_f16.ptr, dl.W_down, d.d_mlp_f16.ptr, DF2_ROWS, err)) return false;
+            strata::ascend_ops::launch_df2_conv(
+                dc.stream, d.d_mlp_f16.ptr, /*x_is_f16=*/1u, d.d_dyn_f16.ptr, /*dyn_col_off=*/320u,
+                base_m + 2 * N, d.d_h_f32.ptr, d.d_h_f32.ptr, /*out_f16=*/nullptr, DF2_ROWS);
+        }
+
+        // Final norm -> INT8 Cube Draft Head + Top-16 + Candidate Selector Projection over rows 1..ND
+        strata::ascend_ops::launch_df2_rms(
+            dc.stream, d.d_h_f32.ptr, /*x_is_f16=*/0u, d.final_norm.ptr,
+            /*y_f32=*/nullptr, d.d_fn_f16.ptr, DF2_ROWS, d.eps);
+
+        const int ND = d.ndraft;
+        const uint16_t* fn_rows1 = reinterpret_cast<const uint16_t*>(d.d_fn_f16.ptr) + N;
+        if (!dc.qgm1_chunked(fn_rows1, d.W_dhead, d.d_logits_f16.ptr, ND, err)) return false;
+        if (!dc.mm(fn_rows1, d.W_sel_proj, d.d_hsel_f16.ptr, ND, err)) return false;
+        strata::ascend_ops::launch_topk16_f16(
+            dc.stream, d.d_logits_f16.ptr, d.d_tk_pv.ptr, d.d_tk_pi.ptr,
+            d.d_topval.ptr, d.d_toptok.ptr, d.d_vmap.ptr,
+            (uint32_t)ND, (uint32_t)d.nd, (uint32_t)d.nd_pad, d.use_map ? 1u : 0u);
+
+        if (!dc.sync(err)) return false;
+
+        if (!d.d_topval.download(d.h_topval.data(), (size_t)ND * 16 * 4, err) ||
+            !d.d_toptok.download(d.h_toptok.data(), (size_t)ND * 16 * 4, err) ||
+            !d.d_hsel_f16.download(d.h_hsel.data(), (size_t)ND * 256 * 2, err)) {
+            return false;
+        }
+
+        // Exact IEEE FP32 left-to-right bilinear selector walk in Host RAM (~3 us!)
+        int32_t prev = anchor;
+        float vp[256], sv[256], sc[16];
+        for (int i = 0; i < ND; ++i) {
+            dequant_cb_row256(d.pred_cb_type, d.pred_cb_raw.data(), prev, vp);
+            const uint16_t* hs = d.h_hsel.data() + (size_t)i * 256;
+            for (int r = 0; r < 256; ++r) vp[r] *= ref::f16_to_f32(hs[r]);
+
+            int bj = 0;
+            float bv = -1e30f;
+            for (int j = 0; j < 16; ++j) {
+                const int32_t cand_tok = d.h_toptok[(size_t)i * 16 + (size_t)j];
+                dequant_cb_row256(d.succ_cb_type, d.succ_cb_raw.data(), cand_tok, sv);
+                float dot = 0.0f;
+                for (int r = 0; r < 256; ++r) dot += sv[r] * vp[r];
+                sc[j] = d.h_topval[(size_t)i * 16 + (size_t)j] + dot;
+                if (sc[j] > bv) { bv = sc[j]; bj = j; }
+            }
+            float z = 0.0f;
+            for (int j = 0; j < 16; ++j) z += std::exp(sc[j] - bv);
+            drafts[i] = d.h_toptok[(size_t)i * 16 + (size_t)bj];
+            if (probs) probs[i] = 1.0f / z;
+            prev = drafts[i];
+        }
+        for (int i = ND; i < DF2_DRAFTS; ++i) {
+            drafts[i] = 0;
+            if (probs) probs[i] = 0.0f;
+        }
+
+        const double dt = now_ms() - t0;
+        d.gpu_ms += dt;
+        ++d.rounds;
+        static const bool df2_stats = std::getenv("STRATA_DF2_STATS") != nullptr;
+        if (df2_stats && d.rounds % 50 == 0) {
+            std::fprintf(stderr, "strata ascend: DFlash2 after %lld rounds: %.2f ms/round avg (last %.2f ms)\n",
+                         (long long)d.rounds, d.gpu_ms / (double)d.rounds, dt);
         }
         return true;
     }
@@ -1789,51 +2804,61 @@ private:
 
     // Exact llama.cpp / Strata sampler chain: logit_bias -> penalties -> top_k -> top_p -> min_p -> temperature -> Philox draw
     bool sample_run(int row0, int n, const strata::kernels::SamplerParams& sp, const int32_t* hist_in, int hl, std::string& err) {
-        if (!ensure_host_logits(row0 + n, err)) return false;
         const bool greedy = sp.greedy || sp.temperature <= 0.0f;
         const float* bias_host = sp.logit_bias ? (const float*)strata::gpu::host_view(sp.logit_bias) : nullptr;
-        const int32_t* hist_host = (hist_in && hl > 0 && sp.penalty_last_n > 0)
+        const int32_t* hist_host = (hist_in && hl > 0 && sp.penalty_last_n > 0 &&
+                                    (sp.penalty_repeat != 1.0f || sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f))
                                        ? (const int32_t*)strata::gpu::host_view(hist_in)
                                        : nullptr;
         const int pen_n = hist_host ? std::min(sp.penalty_last_n, hl) : 0;
 
-        std::vector<float> row((size_t)n_vocab_);
+        // Fast zero-copy path: NPU launch_argmax_f16 already computed exact tok_out_[0..last_T_-1] in run_forward!
+        if (greedy && !bias_host && pen_n == 0) {
+            return true;
+        }
+
+        if (!ensure_host_logits(row0 + n, err)) return false;
+
+        std::vector<float> row;
+        if (bias_host || pen_n > 0) row.resize((size_t)n_vocab_);
         std::vector<int> pen_cnt;
         if (pen_n > 0) pen_cnt.assign((size_t)n_vocab_, 0);
 
         for (int r = 0; r < n; ++r) {
             const float* src = h_logits_f32_.data() + (size_t)(row0 + r) * vocab_pad_;
-            std::memcpy(row.data(), src, (size_t)n_vocab_ * 4);
-
-            if (bias_host) {
-                for (int64_t i = 0; i < n_vocab_; ++i) row[(size_t)i] += bias_host[i];
-            }
-
-            if (pen_n > 0) {
-                const int32_t* hrow = hist_host + (size_t)r * hl + (hl - pen_n);
-                for (int j = 0; j < pen_n; ++j) {
-                    int32_t tid = hrow[j];
-                    if (tid >= 0 && tid < n_vocab_) ++pen_cnt[(size_t)tid];
+            const float* rptr = src;
+            if (bias_host || pen_n > 0) {
+                std::memcpy(row.data(), src, (size_t)n_vocab_ * 4);
+                if (bias_host) {
+                    for (int64_t i = 0; i < n_vocab_; ++i) row[(size_t)i] += bias_host[i];
                 }
-                for (int j = 0; j < pen_n; ++j) {
-                    int32_t tid = hrow[j];
-                    if (tid >= 0 && tid < n_vocab_ && pen_cnt[(size_t)tid] > 0) {
-                        int c = pen_cnt[(size_t)tid];
-                        pen_cnt[(size_t)tid] = 0;
-                        float v = row[(size_t)tid];
-                        v = (v <= 0.0f) ? (v * sp.penalty_repeat) : (v / sp.penalty_repeat);
-                        v -= (float)c * sp.penalty_freq + sp.penalty_present;
-                        row[(size_t)tid] = v;
+                if (pen_n > 0) {
+                    const int32_t* hrow = hist_host + (size_t)r * hl + (hl - pen_n);
+                    for (int j = 0; j < pen_n; ++j) {
+                        int32_t tid = hrow[j];
+                        if (tid >= 0 && tid < n_vocab_) ++pen_cnt[(size_t)tid];
+                    }
+                    for (int j = 0; j < pen_n; ++j) {
+                        int32_t tid = hrow[j];
+                        if (tid >= 0 && tid < n_vocab_ && pen_cnt[(size_t)tid] > 0) {
+                            int c = pen_cnt[(size_t)tid];
+                            pen_cnt[(size_t)tid] = 0;
+                            float v = row[(size_t)tid];
+                            v = (v <= 0.0f) ? (v * sp.penalty_repeat) : (v / sp.penalty_repeat);
+                            v -= (float)c * sp.penalty_freq + sp.penalty_present;
+                            row[(size_t)tid] = v;
+                        }
                     }
                 }
+                rptr = row.data();
             }
 
             if (greedy) {
                 int32_t best_i = 0;
-                float best_v = row[0];
+                float best_v = rptr[0];
                 for (int64_t i = 1; i < n_vocab_; ++i) {
-                    if (row[(size_t)i] > best_v) {
-                        best_v = row[(size_t)i];
+                    if (rptr[(size_t)i] > best_v) {
+                        best_v = rptr[(size_t)i];
                         best_i = (int32_t)i;
                     }
                 }
@@ -1841,15 +2866,21 @@ private:
                 continue;
             }
 
-            const int K = (sp.top_k > 0 && sp.top_k < 64) ? sp.top_k : 64;
-            std::vector<std::pair<float, int32_t>> cand((size_t)n_vocab_);
-            for (int64_t i = 0; i < n_vocab_; ++i) cand[(size_t)i] = {row[(size_t)i], (int32_t)i};
-            const size_t kk = std::min<size_t>((size_t)K, cand.size());
-            std::partial_sort(cand.begin(), cand.begin() + kk, cand.end(),
-                              [](const auto& a, const auto& b) {
-                                  return a.first > b.first || (a.first == b.first && a.second < b.second);
-                              });
-            cand.resize(kk);
+            const size_t kk = (size_t)((sp.top_k > 0 && sp.top_k < 64) ? sp.top_k : 64);
+            std::pair<float, int32_t> cand[64];
+            for (size_t k = 0; k < kk; ++k) cand[k] = {-1e30f, 0x7fffffff};
+            float min_v = -1e30f;
+            for (int64_t i = 0; i < n_vocab_; ++i) {
+                const float v = rptr[(size_t)i];
+                if (v <= min_v) continue; // ascending index scan skips >99.9% of vocabulary in 1 cycle!
+                size_t pos = kk - 1;
+                while (pos > 0 && v > cand[pos - 1].first) {
+                    cand[pos] = cand[pos - 1];
+                    --pos;
+                }
+                cand[pos] = {v, (int32_t)i};
+                min_v = cand[kk - 1].first;
+            }
 
             float mx = cand[0].first;
             std::vector<float> p(kk);
@@ -1931,15 +2962,29 @@ private:
     DevMem d_ple_emb_f32_, d_ple_emb_f16_, d_ple_kv_f16_;
 
     DevMem out_hc_norm_;
-    NzMat W_out_hc_dn_, W_out_hc_up_, W_lm_head_;
+    NzMat W_out_hc_dn_, W_out_hc_up_;
+    Int8ChunkedMat W_lm_head_;
     DevMem d_lm_f16_, d_lm_f32_, d_arg_pv_, d_arg_pi_, d_tok_out_;
 
     HostPinned<float> h_R_, h_bo_, h_inj_, h_ple_emb_, h_logits_f32_;
     HostPinned<uint16_t> h_ple_kv_f16_;
     HostPinned<int32_t> h_tok_buf_;
 
+    // DFlash2 taps & drafter state
+    int df2_dev_ = 0;
+    bool taps_on_ = false;
+    std::vector<int> tap_layers_;
+    int tap_slot_[64] = {};
+    int tap_dev_slot_[64] = {};
+    std::vector<int> tap_dev_of_, tap_dev_local_;
+    int64_t tap_first_ = 0;
+    std::function<bool(const float*, int64_t, int64_t, std::string&)> tap_cb_;
+    HostPinned<float> h_tap_raw_, h_tap_dec_, h_tap_pro_;
+    std::unique_ptr<Df2Ascend> df2_;
+
     int hp_ = 0;
-    int pend_fold_ = 0;
+    int pend_fold_hp_ = 0;
+    int pend_fold_dev_[8] = {};
     int last_T_ = 0;
     bool last_head_ = false;
     uint32_t logits_copied_mask_ = 0;
@@ -2070,15 +3115,23 @@ bool window_slot_copy_main(bool, int, int64_t, bool, std::string& err) {
     return false;
 }
 
-bool window_taps(void*, const std::vector<int>&, const float**, std::string& err) {
-    err = "ascend window: DFlash2 taps are not supported on Ascend";
-    return false;
+bool window_taps(void* w, const std::vector<int>& layers, const float** tap_dev, std::string& err) {
+    auto* x = (WindowAscend*)w;
+    if (!x->taps_enable(layers, err)) return false;
+    *tap_dev = x->tap_dec_ptr();
+    return true;
 }
 
-bool prompt_taps(const std::vector<int>&, int64_t, const std::function<bool(const float*, int64_t, int64_t, std::string&)>&,
+bool prompt_taps(const std::vector<int>& layers, int64_t first_pos,
+                 const std::function<bool(const float*, int64_t, int64_t, std::string&)>& cb,
                  std::string& err) {
-    err = "ascend window: DFlash2 prompt taps are not supported on Ascend";
-    return false;
+    if (!g_the_window || !g_the_window->ready()) {
+        err = "ascend prompt: decode window is not initialized";
+        return false;
+    }
+    if (cb && !g_the_window->taps_enable(layers, err)) return false;
+    g_the_window->taps_set_cb(first_pos, cb);
+    return true;
 }
 
 bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
@@ -2115,30 +3168,159 @@ const int32_t* mrope_table() { return strata::metal_engine::g_mrope_dev; }
 }  // namespace strata::kernels
 
 namespace strata::core {
+
 Dflash2Drafter::~Dflash2Drafter() {}
-bool Dflash2Drafter::load(const std::string&, int, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-bool Dflash2Drafter::bind(const WeightTable&, const NativeHead*, const std::string&, std::string& err, int) { err = "dflash2: not supported on Ascend"; return false; }
-bool Dflash2Drafter::bind_raw(EmbedFn, const void*, int, int64_t, const std::vector<int32_t>&, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-bool Dflash2Drafter::clone_alloc(const Dflash2Drafter&, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-bool Dflash2Drafter::clone_bind(const Dflash2Drafter&, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-bool Dflash2Drafter::copy_state_from(Dflash2Drafter&, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-float* Dflash2Drafter::defer_rows(int64_t, int, std::string& err) { err = "dflash2: not supported on Ascend"; return nullptr; }
+
+bool Dflash2Drafter::load(const std::string& pack_path, int device, std::string& err) {
+    device_ = device;
+    std::vector<int> taps;
+    std::map<std::string, gguf::Tensor> ten;
+    std::map<std::string, std::string> cfg;
+    uint64_t total = 0, data_off = 0;
+    if (!strata::metal_engine::df2_read_index(pack_path, taps, ten, total, data_off, cfg, err)) return false;
+    taps_ = taps;
+    if (cfg.count("mask_token")) mask_token_ = std::atoi(cfg["mask_token"].c_str());
+    strata::metal_engine::g_df2_pack_path = pack_path;
+    return true;
+}
+
+bool Dflash2Drafter::bind(const WeightTable&, const NativeHead*, const std::string& vocab_file, std::string& err, int) {
+    strata::metal_engine::WindowAscend* w = strata::metal_engine::g_the_window;
+    if (w == nullptr || !w->ready()) {
+        err = "dflash2: Ascend decode window is not initialized";
+        return false;
+    }
+    if (bound_) return true;
+    if (!w->df2_ensure(strata::metal_engine::g_df2_pack_path, err) || !w->df2_bind(vocab_file, err)) return false;
+    w->df2_set_cap(ndraft_);
+    device_ = w->df2_dev();
+    vram_ = w->df2_bytes();
+    bound_ = true;
+    return true;
+}
+
+bool Dflash2Drafter::bind_raw(EmbedFn, const void*, int, int64_t, const std::vector<int32_t>&, std::string& err) {
+    err = "dflash2: bind_raw is a test hook of the CUDA / HIP build";
+    return false;
+}
+
+bool Dflash2Drafter::clone_alloc(const Dflash2Drafter&, std::string& err) { err = "dflash2: batch slot drafters are not enabled on Ascend"; return false; }
+bool Dflash2Drafter::clone_bind(const Dflash2Drafter&, std::string& err) { err = "dflash2: batch slot drafters are not enabled on Ascend"; return false; }
+bool Dflash2Drafter::copy_state_from(Dflash2Drafter&, std::string& err) { err = "dflash2: copy_state_from is not enabled on Ascend"; return false; }
+float* Dflash2Drafter::defer_rows(int64_t, int, std::string& err) { err = "dflash2: deferred rows are not enabled on Ascend"; return nullptr; }
 bool Dflash2Drafter::catch_up(int64_t, std::string&) { return true; }
-void Dflash2Drafter::reset() { have_ctx_ = 0; cur_.hist.clear(); ++epoch_; ring_hi_ = 0; }
-bool Dflash2Drafter::begin_request(const int32_t*, int64_t, int64_t, bool* cold) { if (cold) *cold = false; return true; }
+
+void Dflash2Drafter::reset() {
+    have_ctx_ = 0;
+    cur_.hist.clear();
+    ++epoch_;
+    ring_hi_ = 0;
+    if (strata::metal_engine::WindowAscend* w = strata::metal_engine::g_the_window) w->df2_set_floor(0);
+}
+
+bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold) {
+    resume = std::max<int64_t>(0, std::min(resume, n));
+    int64_t lcp = 0;
+    const int64_t lim = std::min<int64_t>((int64_t)cur_.hist.size(), resume);
+    while (lcp < lim && cur_.hist[(size_t)lcp] == ids[lcp]) ++lcp;
+    const bool stale = ring_hi_ > lcp && lcp < resume;
+    bool rebuilt = false;
+    last_rebuilt = 0;
+    last_missing = 0;
+    last_swapped = false;
+    if (stale) {
+        const double t0 = strata::metal_engine::now_ms();
+        std::string rerr;
+        if (strata::metal_engine::WindowAscend* w = strata::metal_engine::g_the_window) {
+            const int64_t nr = w->df2_restore_lineage(cur_.hist, ring_hi_, ids, resume, rerr);
+            if (nr > 0) {
+                rebuilt = true;
+                last_rebuilt = nr;
+                last_swapped = true;
+                last_ms = strata::metal_engine::now_ms() - t0;
+            }
+        }
+        ++epoch_;
+        ring_hi_ = rebuilt ? resume : 0;
+    }
+    if (rebuilt) {
+        if (cold) *cold = false;
+        cur_.hist.assign(ids, ids + n);
+        return true;
+    }
+    if (strata::metal_engine::WindowAscend* w = strata::metal_engine::g_the_window) {
+        w->df2_set_floor(stale ? resume : std::min<int64_t>(w->df2_floor(), resume));
+    }
+    if (cold) *cold = stale;
+    cur_.hist.assign(ids, ids + n);
+    return true;
+}
+
 void Dflash2Drafter::init_ring_log() {}
-void Dflash2Drafter::copy_log_state_from(const Dflash2Drafter&) {}
+void Dflash2Drafter::copy_log_state_from(const Dflash2Drafter& src) { cur_.hist = src.cur_.hist; epoch_ = src.epoch_; ring_hi_ = src.ring_hi_; }
 uint64_t Dflash2Drafter::ring_log_bytes() const { return 0; }
 uint64_t Dflash2Drafter::ring_stash_bytes() const { return 0; }
-void Dflash2Drafter::note_rows(const int32_t*, int64_t, int64_t) {}
-bool Dflash2Drafter::context(const float*, int64_t, int64_t, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-bool Dflash2Drafter::context_async(const float*, int64_t, int64_t, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
+
+void Dflash2Drafter::note_rows(const int32_t* toks, int64_t n, int64_t pos0) {
+    if (pos0 < 0) return;
+    if ((int64_t)cur_.hist.size() > pos0) cur_.hist.resize((size_t)pos0);
+    if ((int64_t)cur_.hist.size() < pos0) return;
+    cur_.hist.insert(cur_.hist.end(), toks, toks + n);
+}
+
+bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::string& err) {
+    strata::metal_engine::WindowAscend* w = strata::metal_engine::g_the_window;
+    if (w == nullptr || !w->ready()) { err = "dflash2: Ascend window not ready"; return false; }
+    if (!bound_) {
+        if (!w->df2_ensure(strata::metal_engine::g_df2_pack_path, err) || !w->df2_bind("", err)) return false;
+        w->df2_set_cap(ndraft_);
+        device_ = w->df2_dev();
+        vram_ = w->df2_bytes();
+        bound_ = true;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!w->df2_context_ptr(taps, n, pos0, err)) return false;
+    ms_ctx += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
+    ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n);
+    return true;
+}
+
+bool Dflash2Drafter::context_async(const float* taps, int64_t n, int64_t pos0, std::string& err) {
+    return context(taps, n, pos0, err);
+}
+
 bool Dflash2Drafter::context_wait(std::string&) { return true; }
-bool Dflash2Drafter::draft(const float*, int, int64_t, int32_t, int32_t*, float*, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-bool Dflash2Drafter::draft_launch(const float*, int, int64_t, int32_t, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-bool Dflash2Drafter::draft_finish(int32_t*, float*, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-bool Dflash2Drafter::prepare(const float*, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-void Dflash2Drafter::set_max_drafts(int n) { ndraft_ = n; }
-bool Dflash2Drafter::debug_rows(std::vector<float>&, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
-bool Dflash2Drafter::debug_ring(std::vector<float>&, std::vector<int64_t>&, std::string& err) { err = "dflash2: not supported on Ascend"; return false; }
+
+bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err) {
+    strata::metal_engine::WindowAscend* w = strata::metal_engine::g_the_window;
+    if (w == nullptr || !bound_) { err = "dflash2: not bound"; return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!w->df2_draft(taps, n_new, pos0, anchor, drafts, probs, err)) return false;
+    ms_draft += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ms_gpu = w->df2_gpu_ms();
+    ++rounds;
+    have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n_new);
+    ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n_new);
+    return true;
+}
+
+bool Dflash2Drafter::draft_launch(const float*, int, int64_t, int32_t, std::string& err) { err = "dflash2: split draft is not enabled on Ascend"; return false; }
+bool Dflash2Drafter::draft_finish(int32_t*, float*, std::string& err) { err = "dflash2: split draft is not enabled on Ascend"; return false; }
+
+bool Dflash2Drafter::prepare(const float*, std::string& err) {
+    strata::metal_engine::WindowAscend* w = strata::metal_engine::g_the_window;
+    if (w == nullptr || !bound_) { err = "dflash2: not bound"; return false; }
+    return w->df2_prepare(err);
+}
+
+void Dflash2Drafter::set_max_drafts(int n) {
+    n = std::max(1, std::min(n, (int)kDrafts));
+    ndraft_ = n;
+    if (strata::metal_engine::WindowAscend* w = strata::metal_engine::g_the_window) w->df2_set_cap(n);
+}
+
+bool Dflash2Drafter::debug_rows(std::vector<float>&, std::string& err) { err = "dflash2: debug_rows not enabled on Ascend"; return false; }
+bool Dflash2Drafter::debug_ring(std::vector<float>&, std::vector<int64_t>&, std::string& err) { err = "dflash2: debug_ring not enabled on Ascend"; return false; }
+
 }  // namespace strata::core

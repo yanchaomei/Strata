@@ -880,7 +880,185 @@ int main() {
         if (cos_sim <= 0.999 || mc.max_abs >= 5e-2f) return 1;
     }
 
-    std::printf("ALL 8 ASCEND PARITY SUITES PASSED!\n");
+    // ------------------------------------------------------------------------
+    // 9. Native DFlash2 Kernels (tap + rms + kv_write + conv + qk_prep + attn + swiglu + topk16)
+    // ------------------------------------------------------------------------
+    {
+        const uint32_t B = 8, N = 2560, HC = 4, RING = 2064, WIN = 2048, INTER = 7680;
+        const float eps = 1e-6f;
+
+        // 9a. df2_tap
+        std::vector<float> hR(B * HC * N), hBo(B * N), hInj(B * HC), refTap(B * N), gotTap(B * N);
+        for (auto& v : hR) v = rng.sym();
+        for (auto& v : hBo) v = rng.sym() * 0.5f;
+        for (auto& v : hInj) v = rng.sym() * 2.0f;
+        for (uint32_t r = 0; r < B; ++r) {
+            float wsum = 0.0f;
+            for (uint32_t c = 0; c < HC; ++c) wsum += 2.0f / (1.0f + std::exp(-hInj[r * HC + c] * 0.25f));
+            for (uint32_t d = 0; d < N; ++d) {
+                float rs = 0.0f;
+                for (uint32_t c = 0; c < HC; ++c) rs += hR[(r * HC + c) * N + d];
+                refTap[r * N + d] = (rs + hBo[r * N + d] * wsum) * 0.25f;
+            }
+        }
+        DevBuf dR(hR.size() * 4), dBo(hBo.size() * 4), dInj(hInj.size() * 4), dTap(gotTap.size() * 4);
+        dR.upload(hR.data(), hR.size() * 4);
+        dBo.upload(hBo.data(), hBo.size() * 4);
+        dInj.upload(hInj.data(), hInj.size() * 4);
+        strata::ascend_ops::launch_df2_tap(stream, dR.ptr, dBo.ptr, dInj.ptr, dTap.ptr, B);
+
+        // 9b. df2_conv (prepare + finish)
+        std::vector<float> hX(B * N), hBase(4 * N), hRes(B * N), refFin(B * N), gotFin(B * N);
+        std::vector<uint16_t> hDyn16(B * 640), gotXc16(B * N);
+        for (auto& v : hX) v = rng.sym();
+        for (auto& v : hBase) v = rng.sym() * 0.2f;
+        for (auto& v : hRes) v = rng.sym();
+        for (auto& v : hDyn16) v = ref::f32_to_f16(rng.sym() * 0.2f);
+        std::vector<float> refXc(B * N);
+        for (uint32_t b = 0; b < B; ++b) {
+            for (uint32_t c = 0; c < N; ++c) {
+                float acc = 0.0f;
+                for (uint32_t o = 0; o < 2; ++o) {
+                    if (b < o) continue;
+                    float k = hBase[o * N + c] + ref::f16_to_f32(hDyn16[b * 640 + o * 160 + c / 16]);
+                    acc += k * hX[(b - o) * N + c];
+                }
+                refXc[b * N + c] = ref::f16_to_f32(ref::f32_to_f16(acc));
+            }
+        }
+        for (uint32_t b = 0; b < B; ++b) {
+            for (uint32_t c = 0; c < N; ++c) {
+                float acc = 0.0f;
+                for (uint32_t o = 0; o < 2; ++o) {
+                    if (b < o) continue;
+                    float k = hBase[(2 + o) * N + c] + ref::f16_to_f32(hDyn16[b * 640 + 320 + o * 160 + c / 16]);
+                    acc += k * refXc[(b - o) * N + c];
+                }
+                refFin[b * N + c] = hRes[b * N + c] + acc;
+            }
+        }
+        DevBuf dX(B * N * 4), dDyn(B * 640 * 2), dBase(4 * N * 4), dRes(B * N * 4), dXc16(B * N * 2);
+        dX.upload(hX.data(), B * N * 4);
+        dDyn.upload(hDyn16.data(), B * 640 * 2);
+        dBase.upload(hBase.data(), 4 * N * 4);
+        dRes.upload(hRes.data(), B * N * 4);
+        strata::ascend_ops::launch_df2_conv(stream, dX.ptr, 0, dDyn.ptr, 0, dBase.ptr, nullptr, nullptr, dXc16.ptr, B);
+        strata::ascend_ops::launch_df2_conv(stream, dXc16.ptr, 1, dDyn.ptr, 320, (const float*)dBase.ptr + 2 * N, dRes.ptr, dRes.ptr, nullptr, B);
+
+        // 9c. df2_attn (ring wrap + sliding window + bidirectional block)
+        const uint32_t s_pos = 2060, lo_pos = s_pos - (WIN - 1); // wraps around RING=2064!
+        std::vector<float> hQn(B * 4096), hKr(RING * 1024, 0.0f), hVr(RING * 1024, 0.0f), hKb(B * 1024), hVb(B * 1024);
+        for (auto& v : hQn) v = rng.sym() * 0.5f;
+        for (auto& v : hKr) v = rng.sym() * 0.5f;
+        for (auto& v : hVr) v = rng.sym() * 0.5f;
+        for (auto& v : hKb) v = rng.sym() * 0.5f;
+        for (auto& v : hVb) v = rng.sym() * 0.5f;
+
+        std::vector<float> refAo(B * 4096, 0.0f), gotAo(B * 4096);
+        const float sc128 = 1.0f / std::sqrt(128.0f);
+        for (uint32_t row = 0; row < B; ++row) {
+            for (uint32_t h = 0; h < 32; ++h) {
+                uint32_t kvh = h >> 2;
+                const float* q = &hQn[(row * 32 + h) * 128];
+                std::vector<float> scores;
+                std::vector<const float*> vptrs;
+                for (uint32_t p = lo_pos; p < s_pos; ++p) {
+                    if ((int32_t)(s_pos + row) - (int32_t)p >= (int32_t)WIN) continue;
+                    const float* k = &hKr[((p % RING) * 8 + kvh) * 128];
+                    float dot = 0.0f;
+                    for (uint32_t d = 0; d < 128; ++d) dot += q[d] * k[d];
+                    scores.push_back(dot * sc128);
+                    vptrs.push_back(&hVr[((p % RING) * 8 + kvh) * 128]);
+                }
+                for (uint32_t b = 0; b < B; ++b) {
+                    const float* k = &hKb[(b * 8 + kvh) * 128];
+                    float dot = 0.0f;
+                    for (uint32_t d = 0; d < 128; ++d) dot += q[d] * k[d];
+                    scores.push_back(dot * sc128);
+                    vptrs.push_back(&hVb[(b * 8 + kvh) * 128]);
+                }
+                float mx = -1e30f;
+                for (float sv : scores) mx = std::max(mx, sv);
+                float lsum = 0.0f, acc[128] = {};
+                for (size_t i = 0; i < scores.size(); ++i) {
+                    float pr = std::exp(scores[i] - mx);
+                    lsum += pr;
+                    for (uint32_t d = 0; d < 128; ++d) acc[d] += pr * vptrs[i][d];
+                }
+                for (uint32_t d = 0; d < 128; ++d)
+                    refAo[(row * 32 + h) * 128 + d] = ref::f16_to_f32(ref::f32_to_f16(acc[d] / lsum));
+            }
+        }
+        DevBuf dQn(hQn.size() * 4), dKr(hKr.size() * 4), dVr(hVr.size() * 4), dKb(hKb.size() * 4), dVb(hVb.size() * 4), dAo16(B * 4096 * 2);
+        dQn.upload(hQn.data(), hQn.size() * 4);
+        dKr.upload(hKr.data(), hKr.size() * 4);
+        dVr.upload(hVr.data(), hVr.size() * 4);
+        dKb.upload(hKb.data(), hKb.size() * 4);
+        dVb.upload(hVb.data(), hVb.size() * 4);
+        strata::ascend_ops::launch_df2_attn(stream, dQn.ptr, dKr.ptr, dVr.ptr, dKb.ptr, dVb.ptr, dAo16.ptr, s_pos, lo_pos, RING, WIN);
+
+        // 9d. df2_swiglu_f16 + topk16_f16 (non-16-divisible n_cols = 106599, row_stride = 106624, with vmap!)
+        const uint32_t ND = 7, NCOLS = 106599, RSTRIDE = 106624;
+        std::vector<uint16_t> hGu16(2 * 2 * INTER), gotSw16(2 * INTER);
+        for (auto& v : hGu16) v = ref::f32_to_f16(rng.sym() * 2.0f);
+        DevBuf dGu(hGu16.size() * 2), dSw(gotSw16.size() * 2);
+        dGu.upload(hGu16.data(), hGu16.size() * 2);
+        strata::ascend_ops::launch_df2_swiglu_f16(stream, dGu.ptr, dSw.ptr, 2, INTER);
+
+        std::vector<uint16_t> hLog(ND * RSTRIDE, ref::f32_to_f16(999.0f)); // padding cols filled with huge value to verify n_cols cutoff!
+        std::vector<int32_t> hVmap(((NCOLS + 7) / 8) * 8, 0);
+        for (uint32_t c = 0; c < NCOLS; ++c) hVmap[c] = (int32_t)(c * 2 + 3);
+        for (uint32_t r = 0; r < ND; ++r) {
+            for (uint32_t c = 0; c < NCOLS; ++c) hLog[r * RSTRIDE + c] = ref::f32_to_f16(rng.sym() * 3.0f);
+            for (uint32_t k = 0; k < 16; ++k) {
+                uint32_t idx = (k == 15) ? (NCOLS - 1) : (r * 1000 + k * 37);
+                hLog[r * RSTRIDE + idx] = ref::f32_to_f16(20.0f - 0.5f * (float)k);
+            }
+        }
+        DevBuf dLog(hLog.size() * 2), dTkPv(ND * 8 * 16 * 4), dTkPi(ND * 8 * 16 * 4);
+        DevBuf dTopV(ND * 16 * 4), dTopT(ND * 16 * 4), dVmap(hVmap.size() * 4);
+        dLog.upload(hLog.data(), hLog.size() * 2);
+        dVmap.upload(hVmap.data(), hVmap.size() * 4);
+        strata::ascend_ops::launch_topk16_f16(stream, dLog.ptr, dTkPv.ptr, dTkPi.ptr, dTopV.ptr, dTopT.ptr, dVmap.ptr, ND, NCOLS, RSTRIDE, 1);
+        ACL_CHECK(aclrtSynchronizeStream(stream));
+
+        dTap.download(gotTap.data(), gotTap.size() * 4);
+        dRes.download(gotFin.data(), gotFin.size() * 4);
+        std::vector<uint16_t> gotAo16(B * 4096);
+        dAo16.download(gotAo16.data(), gotAo16.size() * 2);
+        for (size_t i = 0; i < gotAo.size(); ++i) gotAo[i] = ref::f16_to_f32(gotAo16[i]);
+        dSw.download(gotSw16.data(), gotSw16.size() * 2);
+        std::vector<float> refSw(2 * INTER), gotSw(2 * INTER);
+        for (uint32_t r = 0; r < 2; ++r) {
+            for (uint32_t i = 0; i < INTER; ++i) {
+                float gv = ref::f16_to_f32(hGu16[r * 2 * INTER + i]);
+                float uv = ref::f16_to_f32(hGu16[r * 2 * INTER + INTER + i]);
+                refSw[r * INTER + i] = ref::f16_to_f32(ref::f32_to_f16(silu_f(gv) * uv));
+                gotSw[r * INTER + i] = ref::f16_to_f32(gotSw16[r * INTER + i]);
+            }
+        }
+        std::vector<int32_t> gotTopT(ND * 16);
+        dTopT.download(gotTopT.data(), gotTopT.size() * 4);
+        bool topk_ok = true;
+        for (uint32_t r = 0; r < ND; ++r) {
+            for (uint32_t k = 0; k < 16; ++k) {
+                uint32_t exp_idx = (k == 15) ? (NCOLS - 1) : (r * 1000 + k * 37);
+                if (gotTopT[r * 16 + k] != hVmap[exp_idx]) topk_ok = false;
+            }
+        }
+
+        auto mt = compare_f32(gotTap.data(), refTap.data(), refTap.size());
+        auto mc = compare_f32(gotFin.data(), refFin.data(), refFin.size());
+        auto ma = compare_f32(gotAo.data(), refAo.data(), refAo.size());
+        auto ms = compare_f32(gotSw.data(), refSw.data(), refSw.size());
+        float mx = std::max({mt.max_abs, mc.max_abs, ma.max_abs, ms.max_abs});
+        std::printf("[9] dflash2 (tap+conv+attn+swiglu+topk16): tap=%.2e conv=%.2e attn=%.2e sw=%.2e topk=%s %s\n",
+                    mt.max_abs, mc.max_abs, ma.max_abs, ms.max_abs, topk_ok ? "EXACT" : "FAIL",
+                    (mx < 3e-3f && topk_ok) ? "PASS" : "FAIL");
+        if (mx >= 3e-3f || !topk_ok) return 1;
+    }
+
+    std::printf("ALL 9 ASCEND PARITY SUITES PASSED!\n");
     ACL_CHECK(aclrtDestroyStream(stream));
     ACL_CHECK(aclrtResetDevice(0));
     ACL_CHECK(aclFinalize());
