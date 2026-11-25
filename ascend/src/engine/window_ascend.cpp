@@ -1,13 +1,14 @@
-// ascend/src/engine/window_ascend.cpp - Multi-NPU Huawei Ascend (CANN 9.1 / dav-m200 + Cube FRACTAL_NZ) engine for Strata.
+// ascend/src/engine/window_ascend.cpp - Extreme Multi-NPU Huawei Ascend (CANN 9.1 / dav-m200 + INT8/FP16 Cube FRACTAL_NZ) engine for Strata.
 //
-// Implements strata::metal_engine::* over 1 or 2 Ascend 310P3 NPUs:
+// Implements strata::metal_engine::* across 1..8 Ascend 310P3 NPUs:
 //   - Dense projections (HC down/inject/up, GDN fused qkv/z/alpha/beta + ssm_out, QSA fused q/k/v/iq/ik + attn_out,
-//     MoE router + shared expert gate/up/sg + down, PLE key/value, and 248320-row LM head) are dequantized once at
-//     init into FP16 FRACTAL_NZ weights on the DaVinci Cube Cores (aclnnMm).
-//   - All 48 x 512 routed Q2_0 experts are split into 32B-aligned planar (qs, d) buffers in NPU HBM and executed on
-//     8 AI Cores via custom Ascend C kernels (ascend_ops.asc).
-//   - When >= 2 NPUs are visible (default on .100 with davinci4 + davinci6), layers 0..23 + PLE live on NPU 0 (~19.6 GiB)
-//     and layers 24..47 + output_hc + LM head live on NPU 1 (~20.8 GiB), transferring only ~50 KB per token at layer 24.
+//     MoE router + shared expert gate/up/sg + down, PLE key/value, and 248320-row LM head) run on DaVinci FP16 Cube
+//     Cores (aclnnMm + ACL_FORMAT_FRACTAL_NZ).
+//   - Routed MoE experts (E=512, top_k=10) dynamically fill up to ~98.5% of every NPU's HBM with 280-TOPS INT8
+//     FRACTAL_NZ Grouped Cube weights (aclnnQuantGroupedMatmulDequantWeightNZ), falling back to 8-core vectorized
+//     planar Q2_0 only for the final few layers if HBM headroom requires it.
+//   - Host DDR4 RAM caches pre-packed FRACTAL_NZ dense/expert weights (/dev/shm tmpfs) and pre-dequantized FP32 token
+//     embeddings, with DMA-pinned host staging (aclrtMallocHost) and NUMA-local thread affinity.
 
 #include "ascend_ops.h"
 #include "geo.h"
@@ -16,6 +17,7 @@
 
 #include "acl/acl.h"
 #include "aclnnop/aclnn_mm.h"
+#include "aclnnop/aclnn_quant_grouped_matmul_dequant_weight_nz.h"
 #include "aclnnop/aclnn_trans_matmul_weight.h"
 
 #define STRATA_GGUF_MAIN_DISABLED 1
@@ -28,8 +30,16 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/sampler.hpp"
 
+#include <fcntl.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -56,8 +66,8 @@ namespace {
 using namespace strata_metal::geo;
 
 constexpr int MAXT = 8;
-constexpr int PROMPT_CHUNK_DEFAULT = 64;
-constexpr int MAX_ROWS = 64;  // max rows per NPU pass (supports T=1..8 decode/verify and C=1..64 prompt chunks)
+constexpr int PROMPT_CHUNK_DEFAULT = 256;
+constexpr int MAX_ROWS = 256;  // full-batch NPU pass for C=1..256 prompt chunks and T=1..8 decode/verify
 
 constexpr int W_HC_DN_COLS = 336;   // 320 + 4 + 12 pad (multiple of 16)
 constexpr int GDN_IN_COLS  = 16480; // 10240 + 6144 + 48 + 48
@@ -75,6 +85,167 @@ bool check_acl(aclError e, const char* what, std::string& err) {
     err = std::string("ascend window: ") + what + " failed (aclError=" + std::to_string((int)e) + ")";
     return false;
 }
+
+// Unlock all 0..63 host CPUs during parallel 64-core startup (generate.cpp pins the caller to CPU 0 beforehand!)
+void unpin_all_cpus() {
+#ifdef __linux__
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    const unsigned ncpu = std::max(64u, std::thread::hardware_concurrency());
+    for (unsigned c = 0; c < std::min(ncpu, (unsigned)CPU_SETSIZE); ++c) CPU_SET((int)c, &all);
+    (void)sched_setaffinity(0, sizeof(all), &all);
+#endif
+}
+
+// Pin the main engine host thread to NUMA Node 1 (CPUs 32..63, local to PCIe 0000:8x:00.0 NPUs on TaiShan 200)
+void pin_host_thread_numa1() {
+#ifdef __linux__
+    const char* no_pin = std::getenv("STRATA_ASCEND_NO_NUMA_PIN");
+    if (no_pin && std::string(no_pin) == "1") return;
+    cpu_set_t target;
+    CPU_ZERO(&target);
+    for (int c = 32; c < 64; ++c) CPU_SET(c, &target);
+    (void)sched_setaffinity(0, sizeof(target), &target);
+#endif
+}
+
+// DMA-pinned host staging buffer via aclrtMallocHost (with 64B-aligned fallback)
+template <typename T>
+struct HostPinned {
+    T* ptr = nullptr;
+    size_t count = 0;
+    bool acl_pinned = false;
+
+    HostPinned() = default;
+    HostPinned(const HostPinned&) = delete;
+    HostPinned& operator=(const HostPinned&) = delete;
+    ~HostPinned() { reset(); }
+
+    void reset() {
+        if (ptr) {
+            if (acl_pinned) (void)aclrtFreeHost(ptr);
+            else std::free(ptr);
+            ptr = nullptr;
+            count = 0;
+            acl_pinned = false;
+        }
+    }
+
+    bool alloc(size_t n) {
+        reset();
+        if (n == 0) return true;
+        const size_t bytes = ((n * sizeof(T) + 63) & ~size_t(63)) + 64;
+        void* p = nullptr;
+        if (aclrtMallocHost(&p, bytes) == ACL_SUCCESS && p != nullptr) {
+            ptr = reinterpret_cast<T*>(p);
+            count = n;
+            acl_pinned = true;
+            std::memset(ptr, 0, bytes);
+            return true;
+        }
+        if (posix_memalign(&p, 64, bytes) == 0 && p != nullptr) {
+            ptr = reinterpret_cast<T*>(p);
+            count = n;
+            acl_pinned = false;
+            std::memset(ptr, 0, bytes);
+            return true;
+        }
+        return false;
+    }
+
+    T* data() { return ptr; }
+    const T* data() const { return ptr; }
+    T& operator[](size_t i) { return ptr[i]; }
+    const T& operator[](size_t i) const { return ptr[i]; }
+};
+
+// RAM-backed binary cache (/dev/shm/chaomei_strata_nz) for instant zero-repack startup
+struct CacheStore {
+    std::string dir;
+    bool enabled = false;
+
+    void init(size_t shard_bytes, int nexp) {
+        const char* env = std::getenv("STRATA_ASCEND_CACHE_DIR");
+        std::string root = (env && env[0] != '\0') ? std::string(env) : std::string("/dev/shm/chaomei_strata_nz");
+        if (root == "0" || root == "off" || root == "none") {
+            enabled = false;
+            return;
+        }
+        (void)::mkdir(root.c_str(), 0700);
+        dir = root + "/s_" + std::to_string(shard_bytes) + "_e" + std::to_string(nexp);
+        if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) {
+            enabled = false;
+            return;
+        }
+        enabled = true;
+    }
+
+    bool has_space_for(size_t bytes) const {
+        if (!enabled) return false;
+        struct statvfs vfs{};
+        if (::statvfs(dir.c_str(), &vfs) != 0) return false;
+        const uint64_t avail = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+        // Always leave >= 32 GiB free in /dev/shm so system/other processes are never starved
+        const uint64_t reserve = 32ULL << 30;
+        return avail >= (uint64_t)bytes + reserve;
+    }
+
+    std::string path_for(const std::string& key) const {
+        return dir + "/" + key;
+    }
+
+    static bool read_exact_fd(int fd, void* dst, size_t bytes) {
+        uint8_t* p = reinterpret_cast<uint8_t*>(dst);
+        size_t off = 0;
+        while (off < bytes) {
+            const size_t chunk = std::min<size_t>(bytes - off, 1ULL << 28);
+            ssize_t r = ::pread(fd, p + off, chunk, (off_t)off);
+            if (r <= 0) return false;
+            off += (size_t)r;
+        }
+        return true;
+    }
+
+    static bool write_exact_fd(int fd, const void* src, size_t bytes) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(src);
+        size_t off = 0;
+        while (off < bytes) {
+            const size_t chunk = std::min<size_t>(bytes - off, 1ULL << 28);
+            ssize_t w = ::write(fd, p + off, chunk);
+            if (w <= 0) return false;
+            off += (size_t)w;
+        }
+        return true;
+    }
+
+    bool load_blob(const std::string& key, void* dst, size_t bytes) const {
+        if (!enabled) return false;
+        const std::string p = path_for(key);
+        int fd = ::open(p.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        struct stat st{};
+        bool ok = (::fstat(fd, &st) == 0 && (size_t)st.st_size == bytes && read_exact_fd(fd, dst, bytes));
+        ::close(fd);
+        return ok;
+    }
+
+    void save_blob(const std::string& key, const void* src, size_t bytes) const {
+        if (!has_space_for(bytes)) return;
+        const std::string final_p = path_for(key);
+        struct stat st{};
+        if (::stat(final_p.c_str(), &st) == 0 && (size_t)st.st_size == bytes) return;
+        const std::string tmp_p = final_p + ".tmp." + std::to_string((int)::getpid());
+        int fd = ::open(tmp_p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) return;
+        bool ok = write_exact_fd(fd, src, bytes);
+        ::close(fd);
+        if (ok) {
+            if (::rename(tmp_p.c_str(), final_p.c_str()) != 0) (void)::unlink(tmp_p.c_str());
+        } else {
+            (void)::unlink(tmp_p.c_str());
+        }
+    }
+};
 
 struct DevMem {
     int dev = 0;
@@ -165,6 +336,18 @@ struct NzMat {
         if (desc) aclDestroyTensor(desc);
     }
 
+    bool upload_cached_nz(int dev, const uint16_t* host_nz, int64_t k, int64_t n, std::string& err) {
+        K = k;
+        N_cols = n;
+        const size_t sz = (size_t)K * (size_t)N_cols * sizeof(uint16_t);
+        if (!mem.alloc(dev, sz, err, false)) return false;
+        if (!mem.upload(host_nz, sz, err)) return false;
+        int64_t shape[2] = {K, N_cols};
+        int64_t stride[2] = {N_cols, 1};
+        desc = aclCreateTensor(shape, 2, ACL_FLOAT16, stride, 0, ACL_FORMAT_FRACTAL_NZ, shape, 2, mem.ptr);
+        return desc != nullptr;
+    }
+
     bool upload_and_format(int dev, aclrtStream stream, void* ws_ptr, size_t ws_cap,
                            const uint16_t* host_kn, int64_t k, int64_t n, std::string& err) {
         K = k;
@@ -203,9 +386,72 @@ struct NzMat {
     }
 };
 
+// Static 280-TOPS INT8 FRACTAL_NZ Grouped Expert Weight [E, N_out, K] -> storage [E, K/32, N_out/16, 16, 32] + scale [E, N_out]
+struct Int8GroupNzMat {
+    DevMem w_nz;
+    DevMem w_scale;
+    int64_t E = 0;
+    int64_t N_out = 0;
+    int64_t K = 0;
+    aclTensor* desc_w = nullptr;
+    aclTensor* desc_scale = nullptr;
+
+    Int8GroupNzMat() = default;
+    Int8GroupNzMat(const Int8GroupNzMat&) = delete;
+    Int8GroupNzMat& operator=(const Int8GroupNzMat&) = delete;
+    Int8GroupNzMat(Int8GroupNzMat&& o) noexcept
+        : w_nz(std::move(o.w_nz)), w_scale(std::move(o.w_scale)),
+          E(o.E), N_out(o.N_out), K(o.K), desc_w(o.desc_w), desc_scale(o.desc_scale) {
+        o.desc_w = nullptr;
+        o.desc_scale = nullptr;
+    }
+    Int8GroupNzMat& operator=(Int8GroupNzMat&& o) noexcept {
+        if (this != &o) {
+            if (desc_w) aclDestroyTensor(desc_w);
+            if (desc_scale) aclDestroyTensor(desc_scale);
+            w_nz = std::move(o.w_nz);
+            w_scale = std::move(o.w_scale);
+            E = o.E;
+            N_out = o.N_out;
+            K = o.K;
+            desc_w = o.desc_w;
+            desc_scale = o.desc_scale;
+            o.desc_w = nullptr;
+            o.desc_scale = nullptr;
+        }
+        return *this;
+    }
+    ~Int8GroupNzMat() {
+        if (desc_w) aclDestroyTensor(desc_w);
+        if (desc_scale) aclDestroyTensor(desc_scale);
+    }
+
+    bool upload_prepacked(int dev, const int8_t* host_nz, const float* host_scale,
+                          int64_t e, int64_t n_out, int64_t k, std::string& err) {
+        E = e;
+        N_out = n_out;
+        K = k;
+        const size_t w_sz = (size_t)E * (size_t)N_out * (size_t)K;
+        const size_t s_sz = (size_t)E * (size_t)N_out * sizeof(float);
+        if (!w_nz.alloc(dev, w_sz, err, false) || !w_nz.upload(host_nz, w_sz, err)) return false;
+        if (!w_scale.alloc(dev, s_sz, err, false) || !w_scale.upload(host_scale, s_sz, err)) return false;
+
+        int64_t wView[3] = {E, N_out, K};
+        int64_t wStr[3]  = {N_out * K, K, 1};
+        int64_t wStor[5] = {E, K / 32, N_out / 16, 16, 32};
+        int64_t sDim[2]  = {E, N_out};
+        int64_t sStr[2]  = {N_out, 1};
+
+        desc_w = aclCreateTensor(wView, 3, ACL_INT8, wStr, 0, ACL_FORMAT_FRACTAL_NZ, wStor, 5, w_nz.ptr);
+        desc_scale = aclCreateTensor(sDim, 2, ACL_FLOAT, sStr, 0, ACL_FORMAT_ND, sDim, 2, w_scale.ptr);
+        return desc_w != nullptr && desc_scale != nullptr;
+    }
+};
+
 struct LayerWeights {
     int dev = 0;
     bool is_qsa = false;
+    bool use_int8_cube = false;
 
     // Hyper-connection attn & ffn
     DevMem hc_attn_norm;   // [4 * 2560] f32
@@ -232,9 +478,15 @@ struct LayerWeights {
     DevMem iq_norm;        // [128] f32
     DevMem ik_norm;        // [128] f32
 
-    // MoE router + shared expert + planar Q2_0 routed experts
+    // MoE router + shared expert
     NzMat  W_moe_in;       // [2560, 1808] f16 NZ
     NzMat  W_shexp_down;   // [640, 2560] f16 NZ
+
+    // Primary 280-TOPS INT8 FRACTAL_NZ Cube routed experts (when use_int8_cube == true)
+    Int8GroupNzMat W_moe_w1; // [nexp, 1280, 2560] INT8 NZ ([gate_640 | up_640])
+    Int8GroupNzMat W_moe_w2; // [nexp, 2560, 640]  INT8 NZ (down)
+
+    // Fallback planar Q2_0 routed experts (when use_int8_cube == false)
     DevMem gu_qs;          // [nexp, 2, 640, 640] u8
     DevMem gu_d;           // [nexp, 2, 640, 40] f16
     DevMem down_qs;        // [nexp, 2560, 160] u8
@@ -265,7 +517,7 @@ struct QsaLayerState {
 struct NpuCtx {
     int dev = 0;
     aclrtStream stream = nullptr;
-    DevMem ws;             // 96 MB Cube workspace
+    DevMem ws;             // 128 MB Cube workspace
     std::vector<aclTensor*> temp_tensors;
 
     DevMem rope_cs;        // [(max_cells + 32) * 64] f32
@@ -296,16 +548,28 @@ struct NpuCtx {
     DevMem qids_i32;       // [MAX_ROWS, 2056] i32
     DevMem xq_f16;         // [MAX_ROWS, 6144] f16
 
-    // MoE scratch (operates on windows of <= 8 rows)
-    DevMem moe_in_f16;     // [MAX_ROWS, 1808] f16
-    DevMem ids_i32;        // [16 * 16] i32
-    DevMem wts_f32;        // [16 * 16] f32
-    DevMem plan_i32;       // [P_INTS] i32
-    DevMem sh_h_f16;       // [MAX_ROWS, 640] f16
-    DevMem sg_f32;         // [16] f32
-    DevMem h_f32;          // [128, 640] f32
-    DevMem ye_f32;         // [128, 2560] f32
-    DevMem ysh_f16;        // [MAX_ROWS, 2560] f16
+    // MoE shared + INT8 Cube + Q2_0 scratch
+    DevMem moe_in_f16;         // [MAX_ROWS, 1808] f16
+    DevMem ids_i32;            // [MAX_ROWS, 16] i32
+    DevMem wts_f32;            // [MAX_ROWS, 16] f32
+    DevMem sh_h_f16;           // [MAX_ROWS, 640] f16
+    DevMem ysh_f16;            // [MAX_ROWS, 2560] f16
+
+    // INT8 Cube MoE scratch (supports full MAX_ROWS * 10 = 2560 routed rows!)
+    DevMem group_cumsum_i64;   // [512] i64
+    aclTensor* desc_group_cumsum = nullptr;
+    DevMem sorted_tok_i32;     // [MAX_ROWS * TOPK + 8] i32
+    DevMem tok_perm_i32;       // [MAX_ROWS, 16] i32
+    DevMem sorted_x_f16;       // [MAX_ROWS * TOPK, 2560] f16
+    DevMem moe_gu_f16;         // [MAX_ROWS * TOPK, 1280] f16
+    DevMem moe_h_f16;          // [MAX_ROWS * TOPK, 640] f16
+    DevMem moe_ye_f16;         // [MAX_ROWS * TOPK, 2560] f16
+
+    // Fallback Q2_0 MoE scratch (8-row windows)
+    DevMem plan_i32;           // [P_INTS] i32
+    DevMem sg_f32;             // [64] f32
+    DevMem h_f32;              // [128, 640] f32
+    DevMem ye_f32;             // [128, 2560] f32
 
     void clear_temp_tensors() {
         for (aclTensor* t : temp_tensors) {
@@ -339,8 +603,38 @@ struct NpuCtx {
         return check_acl(aclnnMm(ws.ptr, ws_need, exec, stream), "aclnnMm", err);
     }
 
+    bool qgm(const void* x_ptr, const Int8GroupNzMat& W, void* out_ptr, int64_t M, std::string& err) {
+        if (!check_acl(aclrtSetDevice(dev), "aclrtSetDevice", err)) return false;
+        int64_t xShape[2] = {M, W.K}, xStride[2] = {W.K, 1};
+        int64_t oShape[2] = {M, W.N_out}, oStride[2] = {W.N_out, 1};
+        aclTensor* tX = aclCreateTensor(xShape, 2, ACL_FLOAT16, xStride, 0, ACL_FORMAT_ND, xShape, 2, const_cast<void*>(x_ptr));
+        aclTensor* tO = aclCreateTensor(oShape, 2, ACL_FLOAT16, oStride, 0, ACL_FORMAT_ND, oShape, 2, out_ptr);
+        temp_tensors.push_back(tX);
+        temp_tensors.push_back(tO);
+
+        char qmode[] = "pertoken";
+        uint64_t ws_need = 0;
+        aclOpExecutor* exec = nullptr;
+        if (!check_acl(aclnnQuantGroupedMatmulDequantWeightNZGetWorkspaceSize(
+                           tX, W.desc_w, W.desc_scale, desc_group_cumsum,
+                           nullptr, nullptr, nullptr, nullptr, qmode, true, tO, &ws_need, &exec),
+                       "aclnnQuantGroupedMatmulDequantWeightNZGetWorkspaceSize", err)) {
+            return false;
+        }
+        if (ws_need > ws.bytes) {
+            if (!check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(grow ws qgm)", err)) return false;
+            if (!ws.alloc(dev, std::max<size_t>((size_t)ws_need, ws.bytes * 2), err, false)) return false;
+        }
+        return check_acl(aclnnQuantGroupedMatmulDequantWeightNZ(ws.ptr, ws_need, exec, stream),
+                         "aclnnQuantGroupedMatmulDequantWeightNZ", err);
+    }
+
     ~NpuCtx() {
         clear_temp_tensors();
+        if (desc_group_cumsum) {
+            aclDestroyTensor(desc_group_cumsum);
+            desc_group_cumsum = nullptr;
+        }
         if (stream) {
             (void)aclrtSetDevice(dev);
             (void)aclrtDestroyStream(stream);
@@ -387,7 +681,7 @@ struct MatSlice {
     int64_t rows = 0;  // N_i in GGUF [K, N_i]
 };
 
-// Parallel dequantize + transpose of one or more GGUF matrices sharing input width K into row-major [K, N_total] FP16
+// Parallel L1-tiled dequantize + transpose of GGUF matrices sharing input width K into row-major [K, N_total] FP16
 void build_fused_kn_f16(const uint8_t* base_map, int64_t K, int64_t N_total,
                         const std::vector<MatSlice>& slices, std::vector<uint16_t>& out_kn,
                         unsigned nth, uint16_t pad_fill = 0) {
@@ -433,6 +727,75 @@ void build_fused_kn_f16(const uint8_t* base_map, int64_t K, int64_t N_total,
         }
         for (auto& th : threads) th.join();
     }
+}
+
+// Parallel 64-core Q2_0 -> INT8 FRACTAL_NZ [E, K/32, N_out/16, 16, 32] + FP32 scale [E, N_out] packer
+void pack_q2_experts_int8_nz(const uint8_t* gate_base, const uint8_t* up_base, const uint8_t* down_base, int nexp,
+                             std::vector<int8_t>& w1_nz, std::vector<float>& w1_sc,
+                             std::vector<int8_t>& w2_nz, std::vector<float>& w2_sc, unsigned nth) {
+    constexpr int GU = 2 * NFF; // 1280
+    constexpr size_t gu_row_bytes = (N / 64) * 18;    // 720 B
+    constexpr size_t dn_row_bytes = (NFF / 64) * 18;  // 180 B
+
+    w1_nz.resize((size_t)nexp * (size_t)GU * (size_t)N);
+    w1_sc.resize((size_t)nexp * (size_t)GU);
+    w2_nz.resize((size_t)nexp * (size_t)N * (size_t)NFF);
+    w2_sc.resize((size_t)nexp * (size_t)N);
+
+    const unsigned workers = std::max(1u, std::min<unsigned>(nth, (unsigned)nexp));
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+    for (unsigned tid = 0; tid < workers; ++tid) {
+        threads.emplace_back([&, tid] {
+            std::vector<float> row_f32((size_t)N);
+            std::vector<int8_t> row_i8((size_t)N);
+
+            auto pack_row = [](int8_t* dst, int e, int r, int N_out, int K_in, const int8_t* src) {
+                const size_t r_hi = (size_t)(r >> 4), r_lo = (size_t)(r & 15);
+                const size_t n_blocks = (size_t)(N_out >> 4), k_blocks = (size_t)(K_in >> 5);
+                for (size_t kh = 0; kh < k_blocks; ++kh) {
+                    const size_t off = ((((size_t)e * k_blocks + kh) * n_blocks + r_hi) * 16 + r_lo) * 32;
+                    std::memcpy(dst + off, src + kh * 32, 32);
+                }
+            };
+
+            for (int e = (int)tid; e < nexp; e += (int)workers) {
+                for (int mat = 0; mat < 2; ++mat) {
+                    const uint8_t* src = (mat == 0 ? gate_base : up_base) + (size_t)e * NFF * gu_row_bytes;
+                    for (int r = 0; r < NFF; ++r) {
+                        ref::dequant(ref::Q2_0, src + (size_t)r * gu_row_bytes, row_f32.data(), N);
+                        float mx = 0.0f;
+                        for (int k = 0; k < N; ++k) mx = std::max(mx, std::fabs(row_f32[(size_t)k]));
+                        const float sc = mx > 0.0f ? (mx / 127.0f) : 1.0f;
+                        const float inv_sc = 1.0f / sc;
+                        const int out_r = mat * NFF + r;
+                        w1_sc[(size_t)e * GU + (size_t)out_r] = sc;
+                        for (int k = 0; k < N; ++k) {
+                            int q = (int)std::nearbyintf(row_f32[(size_t)k] * inv_sc);
+                            row_i8[(size_t)k] = (int8_t)(q < -127 ? -127 : (q > 127 ? 127 : q));
+                        }
+                        pack_row(w1_nz.data(), e, out_r, GU, N, row_i8.data());
+                    }
+                }
+
+                const uint8_t* dsrc = down_base + (size_t)e * N * dn_row_bytes;
+                for (int r = 0; r < N; ++r) {
+                    ref::dequant(ref::Q2_0, dsrc + (size_t)r * dn_row_bytes, row_f32.data(), NFF);
+                    float mx = 0.0f;
+                    for (int k = 0; k < NFF; ++k) mx = std::max(mx, std::fabs(row_f32[(size_t)k]));
+                    const float sc = mx > 0.0f ? (mx / 127.0f) : 1.0f;
+                    const float inv_sc = 1.0f / sc;
+                    w2_sc[(size_t)e * N + (size_t)r] = sc;
+                    for (int k = 0; k < NFF; ++k) {
+                        int q = (int)std::nearbyintf(row_f32[(size_t)k] * inv_sc);
+                        row_i8[(size_t)k] = (int8_t)(q < -127 ? -127 : (q > 127 ? 127 : q));
+                    }
+                    pack_row(w2_nz.data(), e, r, N, NFF, row_i8.data());
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
 }
 
 void split_q2_experts_gu(const uint8_t* gate_base, const uint8_t* up_base, int nexp,
@@ -497,6 +860,7 @@ public:
 
     bool init(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, const std::string& shard1,
               int max_t, int64_t max_cells, std::string& err) {
+        unpin_all_cpus();
         strata::gpu::ensure_acl_initialized();
         ss_ = &ss;
         main_ss_ = &ss;
@@ -519,8 +883,12 @@ public:
             return false;
         }
         const bool force_single = std::getenv("STRATA_ASCEND_SINGLE_NPU") && std::string(std::getenv("STRATA_ASCEND_SINGLE_NPU")) == "1";
-        n_npu_ = (!force_single && dev_cnt >= 2) ? 2 : 1;
-        split_layer_ = (n_npu_ == 2) ? (NL / 2) : NL;
+        int max_npus = (int)std::min<uint32_t>(dev_cnt, 8u);
+        if (const char* em = std::getenv("STRATA_ASCEND_MAX_NPUS")) {
+            int req = std::atoi(em);
+            if (req >= 1 && req < max_npus) max_npus = req;
+        }
+        n_npu_ = force_single ? 1 : max_npus;
 
         max_cells_ = std::max<int64_t>(4096, ((max_cells + 63) / 64) * 64 + 64);
         max_blocks_ = ((max_cells_ / 4 + 16 + 7) / 8) * 8;  // multiple of 8 floats (32B)
@@ -533,6 +901,9 @@ public:
         n_vocab_ = (int64_t)t_out->shape[1];
         vocab_pad_ = ((n_vocab_ + 127) / 128) * 128;
 
+        CacheStore cache;
+        cache.init(f_.file_bytes, nexp_);
+
         // Precompute RoPE table on host
         const double rope_base = f_.meta_num.count("qwen4exp.rope.freq_base") ? f_.meta_num["qwen4exp.rope.freq_base"] : 1e7;
         std::vector<float> h_rope((size_t)(max_cells_ + 32) * 64);
@@ -544,7 +915,7 @@ public:
             }
         }
 
-        // Initialize per-NPU streams & scratch buffers
+        // Initialize per-NPU streams & scratch buffers (Pass 1a)
         npu_.resize((size_t)n_npu_);
         for (int d = 0; d < n_npu_; ++d) {
             npu_[d] = std::make_unique<NpuCtx>();
@@ -552,7 +923,7 @@ public:
             c.dev = d;
             if (!check_acl(aclrtSetDevice(d), "aclrtSetDevice", err) ||
                 !check_acl(aclrtCreateStream(&c.stream), "aclrtCreateStream", err)) return false;
-            if (!c.ws.alloc(d, 96ULL << 20, err, false) ||
+            if (!c.ws.alloc(d, 16ULL << 20, err, false) ||
                 !c.rope_cs.alloc(d, h_rope.size() * 4, err, false) ||
                 !c.rope_cs.upload(h_rope.data(), h_rope.size() * 4, err) ||
                 !c.R.alloc(d, (size_t)MAX_ROWS * HCD * 4, err) ||
@@ -575,24 +946,61 @@ public:
                 !c.qcur_f32.alloc(d, (size_t)MAX_ROWS * QOUT * 4, err) ||
                 !c.qgate_f32.alloc(d, (size_t)MAX_ROWS * QOUT * 4, err) ||
                 !c.qidx_f32.alloc(d, (size_t)MAX_ROWS * IQR * 4, err) ||
-                !c.scores_f32.alloc(d, (size_t)MAX_ROWS * max_blocks_ * 4, err) ||
+                !c.scores_f32.alloc(d, 64, err) ||
                 !c.qids_i32.alloc(d, (size_t)MAX_ROWS * QIDS_STRIDE * 4, err) ||
                 !c.xq_f16.alloc(d, (size_t)MAX_ROWS * QOUT * 2, err) ||
                 !c.moe_in_f16.alloc(d, (size_t)MAX_ROWS * MOE_IN_COLS * 2, err) ||
-                !c.ids_i32.alloc(d, 256 * 4, err) ||
-                !c.wts_f32.alloc(d, 256 * 4, err) ||
-                !c.plan_i32.alloc(d, strata::ascend_ops::P_INTS * 4, err) ||
+                !c.ids_i32.alloc(d, (size_t)MAX_ROWS * 16 * 4, err) ||
+                !c.wts_f32.alloc(d, (size_t)MAX_ROWS * 16 * 4, err) ||
                 !c.sh_h_f16.alloc(d, (size_t)MAX_ROWS * NFF * 2, err) ||
-                !c.sg_f32.alloc(d, 64 * 4, err) ||
+                !c.ysh_f16.alloc(d, (size_t)MAX_ROWS * N * 2, err) ||
+                !c.group_cumsum_i64.alloc(d, 512 * 8, err) ||
+                !c.sorted_tok_i32.alloc(d, (size_t)(MAX_ROWS * TOPK + 8) * 4, err) ||
+                !c.tok_perm_i32.alloc(d, (size_t)MAX_ROWS * 16 * 4, err) ||
+                !c.sorted_x_f16.alloc(d, (size_t)MAX_ROWS * TOPK * N * 2, err) ||
+                !c.moe_gu_f16.alloc(d, (size_t)MAX_ROWS * TOPK * (2 * NFF) * 2, err) ||
+                !c.moe_h_f16.alloc(d, (size_t)MAX_ROWS * TOPK * NFF * 2, err) ||
+                !c.moe_ye_f16.alloc(d, (size_t)MAX_ROWS * TOPK * N * 2, err) ||
+                !c.plan_i32.alloc(d, strata::ascend_ops::P_INTS * 4, err) ||
+                !c.sg_f32.alloc(d, ((MAX_ROWS + 7) / 8) * 8 * 4, err) ||
                 !c.h_f32.alloc(d, 128 * NFF * 4, err) ||
-                !c.ye_f32.alloc(d, 128 * N * 4, err) ||
-                !c.ysh_f16.alloc(d, (size_t)MAX_ROWS * N * 2, err)) {
+                !c.ye_f32.alloc(d, 128 * N * 4, err)) {
+                return false;
+            }
+            int64_t gDim[1] = {nexp_}, gStr[1] = {1};
+            c.desc_group_cumsum = aclCreateTensor(gDim, 1, ACL_INT64, gStr, 0, ACL_FORMAT_ND, gDim, 1, c.group_cumsum_i64.ptr);
+            if (!c.desc_group_cumsum) {
+                err = "ascend window: aclCreateTensor(group_cumsum) failed";
                 return false;
             }
         }
 
-        const unsigned nth = std::max(1u, std::min(24u, std::thread::hardware_concurrency()));
+        const unsigned nth = std::max(1u, std::min(64u, std::thread::hardware_concurrency()));
         const uint8_t* map_base = (const uint8_t*)f_.map;
+
+        // Pre-dequantize token_embd.weight [N, n_vocab_] into Host DDR4 RAM (2.37 GiB) for zero-overhead lookup
+        {
+            const gguf::Tensor* te = f_.find("token_embd.weight");
+            if (!te) { err = "ascend window: missing token_embd.weight"; return false; }
+            const size_t emb_elems = (size_t)n_vocab_ * (size_t)N;
+            h_tok_embd_f32_.resize(emb_elems);
+            if (!cache.load_blob("tok_embd.f32", h_tok_embd_f32_.data(), emb_elems * 4)) {
+                const size_t rb = ref::row_bytes(te->type, N);
+                const uint8_t* sbase = map_base + te->offset;
+                std::vector<std::thread> threads;
+                for (unsigned tid = 0; tid < nth; ++tid) {
+                    threads.emplace_back([&, tid] {
+                        const int64_t r0 = (n_vocab_ * tid) / nth;
+                        const int64_t r1 = (n_vocab_ * (tid + 1)) / nth;
+                        for (int64_t r = r0; r < r1; ++r) {
+                            ref::dequant(te->type, sbase + (size_t)r * rb, h_tok_embd_f32_.data() + (size_t)r * N, N);
+                        }
+                    });
+                }
+                for (auto& th : threads) th.join();
+                cache.save_blob("tok_embd.f32", h_tok_embd_f32_.data(), emb_elems * 4);
+            }
+        }
 
         auto load_f32_vec = [&](const std::string& name, size_t pad_to, std::vector<float>& out) -> bool {
             const gguf::Tensor* t = f_.find(name);
@@ -610,25 +1018,39 @@ public:
             return dm.alloc(dev, tmp.size() * 4, err, false) && dm.upload(tmp.data(), tmp.size() * 4, err);
         };
 
+        std::vector<uint16_t> h_kn;
+        auto load_nz_mat = [&](int dev, const std::string& key, int64_t K_in, int64_t N_cols,
+                               const std::vector<MatSlice>& slices, NzMat& mat, uint16_t pad_fill = 0) -> bool {
+            NpuCtx& nc = *npu_[dev];
+            const size_t sz = (size_t)K_in * (size_t)N_cols * sizeof(uint16_t);
+            h_kn.resize((size_t)K_in * (size_t)N_cols);
+            if (cache.load_blob(key, h_kn.data(), sz)) {
+                return mat.upload_cached_nz(dev, h_kn.data(), K_in, N_cols, err);
+            }
+            build_fused_kn_f16(map_base, K_in, N_cols, slices, h_kn, nth, pad_fill);
+            if (!mat.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), K_in, N_cols, err)) return false;
+            if (cache.has_space_for(sz) && mat.mem.download(h_kn.data(), sz, err)) {
+                cache.save_blob(key, h_kn.data(), sz);
+            }
+            err.clear();
+            return true;
+        };
+
         // PLE setup on NPU 0
         ple_on_ = ss.ple.ready() && f_.find("blk.1.ple_key.weight") != nullptr;
         if (ple_on_) {
-            NpuCtx& c0 = *npu_[0];
             if (!load_f32_vec("blk.1.ple_norm_key.weight", HCD, h_ple_nkey_) ||
                 !load_f32_vec("blk.1.ple_norm_query.weight", HCD, h_ple_nqry_) ||
                 !load_f32_vec("blk.1.ple_norm_conv.weight", HCD, h_ple_nconv_) ||
                 !load_f32_vec("blk.1.ple_conv1d.weight", (size_t)strata::kernels::PLE_CONV_KERNEL * HCD, h_ple_conv_w_)) {
                 return false;
             }
-            // Match Metal/CUDA PLE conv1d half rounding
             for (float& v : h_ple_conv_w_) v = ref::f16_to_f32(ref::f32_to_f16(v));
 
-            std::vector<uint16_t> h_kn;
-            build_fused_kn_f16(map_base, N, HCD + N,
-                               {{f_.find("blk.1.ple_key.weight"), 0, HCD},
-                                {f_.find("blk.1.ple_value.weight"), HCD, N}},
-                               h_kn, nth);
-            if (!W_ple_kv_.upload_and_format(0, c0.stream, c0.ws.ptr, c0.ws.bytes, h_kn.data(), N, HCD + N, err) ||
+            if (!load_nz_mat(0, "ple_kv.nz16", N, HCD + N,
+                             {{f_.find("blk.1.ple_key.weight"), 0, HCD},
+                              {f_.find("blk.1.ple_value.weight"), HCD, N}},
+                             W_ple_kv_) ||
                 !d_ple_emb_f32_.alloc(0, (size_t)MAX_ROWS * N * 4, err) ||
                 !d_ple_emb_f16_.alloc(0, (size_t)MAX_ROWS * N * 2, err) ||
                 !d_ple_kv_f16_.alloc(0, (size_t)MAX_ROWS * (HCD + N) * 2, err)) {
@@ -638,62 +1060,52 @@ public:
         ple_hist_.assign((size_t)strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM, 0.0f);
         last_norm_.assign((size_t)MAX_ROWS * strata::kernels::NG_HC_DIM, 0.0f);
 
-        // Allocate & upload all 48 layers + states
+        // Assign balanced layer partition across n_npu_ devices
         layers_.resize(NL);
         gdn_states_.resize(NGDN);
         qsa_states_.resize(NQSA);
+        std::vector<int> dev_layer_cnt((size_t)n_npu_, 0);
+        for (int l = 0; l < NL; ++l) {
+            const int d = std::min(n_npu_ - 1, (l * n_npu_) / NL);
+            layers_[(size_t)l].dev = d;
+            layers_[(size_t)l].is_qsa = (l % QI == QI - 1);
+            dev_layer_cnt[(size_t)d] += 1;
+        }
 
-        std::fprintf(stderr, "strata ascend: loading %d layers onto %d NPU(s) (split=%d, %u CPU threads)...\n",
-                     NL, n_npu_, split_layer_, nth);
+        std::fprintf(stderr, "strata ascend: Pass 1/2 loading dense FRACTAL_NZ + states onto %d NPU(s) (%u CPU threads, cache=%s)...\n",
+                     n_npu_, nth, cache.enabled ? cache.dir.c_str() : "off");
         std::fflush(stderr);
 
-        std::vector<uint16_t> h_kn;
-        std::vector<uint8_t> h_qs;
-        std::vector<uint16_t> h_d;
-
+        // Pass 1b: Allocate ALL dense weights + GDN/QSA states + Output Head FIRST so exact HBM headroom is known!
         for (int l = 0; l < NL; ++l) {
-            const int dev = (l < split_layer_) ? 0 : 1;
-            NpuCtx& nc = *npu_[dev];
             LayerWeights& lw = layers_[(size_t)l];
-            lw.dev = dev;
-            lw.is_qsa = (l % QI == QI - 1);
+            const int dev = lw.dev;
             const std::string b = "blk." + std::to_string(l) + ".";
+            const std::string pfx = "l" + std::to_string(l) + "_";
 
-            // 1) HC attn + HC ffn
             if (!upload_f32_dev(dev, b + "hc_attn_norm.weight", HCD, lw.hc_attn_norm) ||
                 !upload_f32_dev(dev, b + "hc_ffn_norm.weight", HCD, lw.hc_ffn_norm)) return false;
 
-            build_fused_kn_f16(map_base, HCD, W_HC_DN_COLS,
-                               {{f_.find(b + "hc_attn_down.weight"), 0, LR},
-                                {f_.find(b + "hc_attn_inject.weight"), LR, HC}},
-                               h_kn, nth);
-            if (!lw.W_hc_attn_dn.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), HCD, W_HC_DN_COLS, err)) return false;
+            if (!load_nz_mat(dev, pfx + "hc_adn.nz16", HCD, W_HC_DN_COLS,
+                             {{f_.find(b + "hc_attn_down.weight"), 0, LR},
+                              {f_.find(b + "hc_attn_inject.weight"), LR, HC}}, lw.W_hc_attn_dn) ||
+                !load_nz_mat(dev, pfx + "hc_aup.nz16", LR, HCD,
+                             {{f_.find(b + "hc_attn_up.weight"), 0, HCD}}, lw.W_hc_attn_up) ||
+                !load_nz_mat(dev, pfx + "hc_fdn.nz16", HCD, W_HC_DN_COLS,
+                             {{f_.find(b + "hc_ffn_down.weight"), 0, LR},
+                              {f_.find(b + "hc_ffn_inject.weight"), LR, HC}}, lw.W_hc_ffn_dn) ||
+                !load_nz_mat(dev, pfx + "hc_fup.nz16", LR, HCD,
+                             {{f_.find(b + "hc_ffn_up.weight"), 0, HCD}}, lw.W_hc_ffn_up)) return false;
 
-            build_fused_kn_f16(map_base, LR, HCD, {{f_.find(b + "hc_attn_up.weight"), 0, HCD}}, h_kn, nth);
-            if (!lw.W_hc_attn_up.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), LR, HCD, err)) return false;
-
-            build_fused_kn_f16(map_base, HCD, W_HC_DN_COLS,
-                               {{f_.find(b + "hc_ffn_down.weight"), 0, LR},
-                                {f_.find(b + "hc_ffn_inject.weight"), LR, HC}},
-                               h_kn, nth);
-            if (!lw.W_hc_ffn_dn.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), HCD, W_HC_DN_COLS, err)) return false;
-
-            build_fused_kn_f16(map_base, LR, HCD, {{f_.find(b + "hc_ffn_up.weight"), 0, HCD}}, h_kn, nth);
-            if (!lw.W_hc_ffn_up.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), LR, HCD, err)) return false;
-
-            // 2) Mixer: GDN or QSA
             if (!lw.is_qsa) {
                 const int gi = l - l / QI;
-                build_fused_kn_f16(map_base, N, GDN_IN_COLS,
-                                   {{f_.find(b + "attn_qkv.weight"),  0,             CONV},
-                                    {f_.find(b + "attn_gate.weight"), CONV,          ZV},
-                                    {f_.find(b + "ssm_alpha.weight"), CONV + ZV,     HV},
-                                    {f_.find(b + "ssm_beta.weight"),  CONV + ZV + HV, HV}},
-                                   h_kn, nth);
-                if (!lw.W_gdn_in.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), N, GDN_IN_COLS, err)) return false;
-
-                build_fused_kn_f16(map_base, ZV, N, {{f_.find(b + "ssm_out.weight"), 0, N}}, h_kn, nth);
-                if (!lw.W_ssm_out.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), ZV, N, err)) return false;
+                if (!load_nz_mat(dev, pfx + "gdn_in.nz16", N, GDN_IN_COLS,
+                                 {{f_.find(b + "attn_qkv.weight"),  0,             CONV},
+                                  {f_.find(b + "attn_gate.weight"), CONV,          ZV},
+                                  {f_.find(b + "ssm_alpha.weight"), CONV + ZV,     HV},
+                                  {f_.find(b + "ssm_beta.weight"),  CONV + ZV + HV, HV}}, lw.W_gdn_in) ||
+                    !load_nz_mat(dev, pfx + "ssm_out.nz16", ZV, N,
+                                 {{f_.find(b + "ssm_out.weight"), 0, N}}, lw.W_ssm_out)) return false;
 
                 if (!upload_f32_dev(dev, b + "ssm_conv1d.weight", CONV * 4, lw.ssm_conv_w) ||
                     !upload_f32_dev(dev, b + "ssm_dt.bias", 64, lw.ssm_dt) ||
@@ -710,17 +1122,14 @@ public:
                     !gs.ab_save.alloc(dev, (size_t)MAXT * 96 * 4, err)) return false;
             } else {
                 const int qi = l / QI;
-                build_fused_kn_f16(map_base, N, QSA_IN_COLS,
-                                   {{f_.find(b + "attn_q.weight"),         0,                     QFULL},
-                                    {f_.find(b + "attn_k.weight"),         QFULL,                 KV},
-                                    {f_.find(b + "attn_v.weight"),         QFULL + KV,            KV},
-                                    {f_.find(b + "indexer.q_proj.weight"), QFULL + 2 * KV,        IQR},
-                                    {f_.find(b + "indexer.k_proj.weight"), QFULL + 2 * KV + IQR,  ID}},
-                                   h_kn, nth);
-                if (!lw.W_qsa_in.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), N, QSA_IN_COLS, err)) return false;
-
-                build_fused_kn_f16(map_base, QOUT, N, {{f_.find(b + "attn_output.weight"), 0, N}}, h_kn, nth);
-                if (!lw.W_attn_out.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), QOUT, N, err)) return false;
+                if (!load_nz_mat(dev, pfx + "qsa_in.nz16", N, QSA_IN_COLS,
+                                 {{f_.find(b + "attn_q.weight"),         0,                    QFULL},
+                                  {f_.find(b + "attn_k.weight"),         QFULL,                KV},
+                                  {f_.find(b + "attn_v.weight"),         QFULL + KV,           KV},
+                                  {f_.find(b + "indexer.q_proj.weight"), QFULL + 2 * KV,       IQR},
+                                  {f_.find(b + "indexer.k_proj.weight"), QFULL + 2 * KV + IQR, ID}}, lw.W_qsa_in) ||
+                    !load_nz_mat(dev, pfx + "attn_out.nz16", QOUT, N,
+                                 {{f_.find(b + "attn_output.weight"), 0, N}}, lw.W_attn_out)) return false;
 
                 if (!upload_f32_dev(dev, b + "attn_q_norm.weight", QD, lw.q_norm) ||
                     !upload_f32_dev(dev, b + "attn_k_norm.weight", QD, lw.k_norm) ||
@@ -738,18 +1147,64 @@ public:
                     !qs.pooled.alloc(dev, (size_t)max_blocks_ * ID * 4, err)) return false;
             }
 
-            // 3) MoE router + shared expert + Q2_0 routed experts
-            build_fused_kn_f16(map_base, N, MOE_IN_COLS,
-                               {{f_.find(b + "ffn_gate_inp.weight"),       0,             nexp_},
-                                {f_.find(b + "ffn_gate_shexp.weight"),     512,           NFF},
-                                {f_.find(b + "ffn_up_shexp.weight"),       512 + NFF,     NFF},
-                                {f_.find(b + "ffn_gate_inp_shexp.weight"), 512 + 2 * NFF, 1}},
-                               h_kn, nth);
-            if (!lw.W_moe_in.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), N, MOE_IN_COLS, err)) return false;
+            if (!load_nz_mat(dev, pfx + "moe_in.nz16", N, MOE_IN_COLS,
+                             {{f_.find(b + "ffn_gate_inp.weight"),       0,             nexp_},
+                              {f_.find(b + "ffn_gate_shexp.weight"),     512,           NFF},
+                              {f_.find(b + "ffn_up_shexp.weight"),       512 + NFF,     NFF},
+                              {f_.find(b + "ffn_gate_inp_shexp.weight"), 512 + 2 * NFF, 1}}, lw.W_moe_in) ||
+                !load_nz_mat(dev, pfx + "shexp_dn.nz16", NFF, N,
+                             {{f_.find(b + "ffn_down_shexp.weight"), 0, N}}, lw.W_shexp_down)) return false;
+        }
 
-            build_fused_kn_f16(map_base, NFF, N, {{f_.find(b + "ffn_down_shexp.weight"), 0, N}}, h_kn, nth);
-            if (!lw.W_shexp_down.upload_and_format(dev, nc.stream, nc.ws.ptr, nc.ws.bytes, h_kn.data(), NFF, N, err)) return false;
+        // Output HC + LM Head on final NPU before Pass 2
+        const int last_dev = n_npu_ - 1;
+        if (!upload_f32_dev(last_dev, "output_hc_norm.weight", HCD, out_hc_norm_) ||
+            !load_nz_mat(last_dev, "out_hc_dn.nz16", HCD, W_HC_DN_COLS, {{f_.find("output_hc_down.weight"), 0, LR}}, W_out_hc_dn_) ||
+            !load_nz_mat(last_dev, "out_hc_up.nz16", LR, HCD, {{f_.find("output_hc_up.weight"), 0, HCD}}, W_out_hc_up_) ||
+            !load_nz_mat(last_dev, "lm_head.nz16", N, vocab_pad_, {{t_out, 0, n_vocab_}}, W_lm_head_, 0xFBFFu) ||
+            !d_lm_f16_.alloc(last_dev, (size_t)MAXT * vocab_pad_ * 2, err) ||
+            !d_lm_f32_.alloc(last_dev, (size_t)MAXT * vocab_pad_ * 4, err) ||
+            !d_arg_pv_.alloc(last_dev, (size_t)MAXT * 64 * 4, err) ||
+            !d_arg_pi_.alloc(last_dev, (size_t)MAXT * 64 * 4, err) ||
+            !d_tok_out_.alloc(last_dev, 8 * 4, err)) {
+            return false;
+        }
+        h_kn.clear();
+        h_kn.shrink_to_fit();
 
+        std::fprintf(stderr, "strata ascend: Pass 1/2 dense + states + LM head ready in %.1f s; starting Pass 2/2 MoE expert packing...\n",
+                     (now_ms() - t0) / 1000.0);
+        std::fflush(stderr);
+
+        // Pass 2: Auto-fill HBM on every NPU with 280-TOPS INT8 FRACTAL_NZ Cube MoE experts!
+        const bool force_q2 = std::getenv("STRATA_ASCEND_FORCE_Q2") && std::string(std::getenv("STRATA_ASCEND_FORCE_Q2")) == "1";
+        size_t hbm_reserve = 1050ULL << 20; // ~1.03 GiB headroom (packs 45/48 INT8 Cube layers on 3x48GB 310P3 with self-healing Q2_0 fallback)
+        if (const char* er = std::getenv("STRATA_ASCEND_HBM_RESERVE_MIB")) {
+            int mib = std::atoi(er);
+            if (mib >= 64) hbm_reserve = (size_t)mib << 20;
+        }
+
+        const size_t w1_nz_bytes = (size_t)nexp_ * (size_t)(2 * NFF) * (size_t)N;
+        const size_t w1_sc_bytes = (size_t)nexp_ * (size_t)(2 * NFF) * sizeof(float);
+        const size_t w2_nz_bytes = (size_t)nexp_ * (size_t)N * (size_t)NFF;
+        const size_t w2_sc_bytes = (size_t)nexp_ * (size_t)N * sizeof(float);
+        const size_t int8_layer_bytes = w1_nz_bytes + w1_sc_bytes + w2_nz_bytes + w2_sc_bytes + 8192;
+        const size_t q2_layer_bytes   = (size_t)nexp_ * 2 * NFF * (640 + 80) + (size_t)nexp_ * N * (160 + 20) + 8192;
+
+        std::vector<int8_t> h_w1_nz, h_w2_nz;
+        std::vector<float>  h_w1_sc, h_w2_sc;
+        std::vector<uint8_t> h_qs;
+        std::vector<uint16_t> h_d;
+        std::vector<int> rem_on_dev = dev_layer_cnt;
+        int n_int8_layers = 0, n_q2_layers = 0;
+
+        for (int l = 0; l < NL; ++l) {
+            LayerWeights& lw = layers_[(size_t)l];
+            const int dev = lw.dev;
+            const int rem = rem_on_dev[(size_t)dev];
+            rem_on_dev[(size_t)dev] -= 1;
+
+            const std::string b = "blk." + std::to_string(l) + ".";
             const gguf::Tensor* tg = f_.find(b + "ffn_gate_exps.weight");
             const gguf::Tensor* tu = f_.find(b + "ffn_up_exps.weight");
             const gguf::Tensor* td = f_.find(b + "ffn_down_exps.weight");
@@ -758,60 +1213,98 @@ public:
                 return false;
             }
 
-            split_q2_experts_gu(map_base + tg->offset, map_base + tu->offset, nexp_, h_qs, h_d, nth);
-            if (!lw.gu_qs.alloc(dev, h_qs.size(), err, false) || !lw.gu_qs.upload(h_qs.data(), h_qs.size(), err) ||
-                !lw.gu_d.alloc(dev, h_d.size() * 2, err, false) || !lw.gu_d.upload(h_d.data(), h_d.size() * 2, err)) return false;
+            size_t free_b = 0, total_b = 0;
+            (void)aclrtSetDevice(dev);
+            (void)aclrtGetMemInfo(ACL_HBM_MEM, &free_b, &total_b);
+            const size_t min_for_int8 = int8_layer_bytes + (size_t)(rem - 1) * q2_layer_bytes + hbm_reserve;
+            lw.use_int8_cube = (!force_q2 && free_b >= min_for_int8);
 
-            split_q2_experts_down(map_base + td->offset, nexp_, h_qs, h_d, nth);
-            if (!lw.down_qs.alloc(dev, h_qs.size(), err, false) || !lw.down_qs.upload(h_qs.data(), h_qs.size(), err) ||
-                !lw.down_d.alloc(dev, h_d.size() * 2, err, false) || !lw.down_d.upload(h_d.data(), h_d.size() * 2, err)) return false;
+            if (lw.use_int8_cube) {
+                const std::string pfx = "l" + std::to_string(l) + "_moe_";
+                h_w1_nz.resize(w1_nz_bytes);
+                h_w1_sc.resize(w1_sc_bytes / 4);
+                h_w2_nz.resize(w2_nz_bytes);
+                h_w2_sc.resize(w2_sc_bytes / 4);
+
+                bool hit = cache.load_blob(pfx + "w1.nz8", h_w1_nz.data(), w1_nz_bytes) &&
+                           cache.load_blob(pfx + "w1.sc",  h_w1_sc.data(), w1_sc_bytes) &&
+                           cache.load_blob(pfx + "w2.nz8", h_w2_nz.data(), w2_nz_bytes) &&
+                           cache.load_blob(pfx + "w2.sc",  h_w2_sc.data(), w2_sc_bytes);
+                if (!hit) {
+                    pack_q2_experts_int8_nz(map_base + tg->offset, map_base + tu->offset, map_base + td->offset,
+                                            nexp_, h_w1_nz, h_w1_sc, h_w2_nz, h_w2_sc, nth);
+                    if (cache.has_space_for(int8_layer_bytes)) {
+                        cache.save_blob(pfx + "w1.nz8", h_w1_nz.data(), w1_nz_bytes);
+                        cache.save_blob(pfx + "w1.sc",  h_w1_sc.data(), w1_sc_bytes);
+                        cache.save_blob(pfx + "w2.nz8", h_w2_nz.data(), w2_nz_bytes);
+                        cache.save_blob(pfx + "w2.sc",  h_w2_sc.data(), w2_sc_bytes);
+                    }
+                }
+                if (!lw.W_moe_w1.upload_prepacked(dev, h_w1_nz.data(), h_w1_sc.data(), nexp_, 2 * NFF, N, err) ||
+                    !lw.W_moe_w2.upload_prepacked(dev, h_w2_nz.data(), h_w2_sc.data(), nexp_, N, NFF, err)) {
+                    // Self-healing fallback: if HBM hugepages fragment near the 98% ceiling, fall back cleanly to Q2_0!
+                    lw.W_moe_w1 = {};
+                    lw.W_moe_w2 = {};
+                    err.clear();
+                    lw.use_int8_cube = false;
+                } else {
+                    ++n_int8_layers;
+                }
+            }
+            if (!lw.use_int8_cube) {
+                split_q2_experts_gu(map_base + tg->offset, map_base + tu->offset, nexp_, h_qs, h_d, nth);
+                if (!lw.gu_qs.alloc(dev, h_qs.size(), err, false) || !lw.gu_qs.upload(h_qs.data(), h_qs.size(), err) ||
+                    !lw.gu_d.alloc(dev, h_d.size() * 2, err, false) || !lw.gu_d.upload(h_d.data(), h_d.size() * 2, err)) return false;
+
+                split_q2_experts_down(map_base + td->offset, nexp_, h_qs, h_d, nth);
+                if (!lw.down_qs.alloc(dev, h_qs.size(), err, false) || !lw.down_qs.upload(h_qs.data(), h_qs.size(), err) ||
+                    !lw.down_d.alloc(dev, h_d.size() * 2, err, false) || !lw.down_d.upload(h_d.data(), h_d.size() * 2, err)) return false;
+                ++n_q2_layers;
+            }
 
             if ((l + 1) % 8 == 0 || l + 1 == NL) {
-                std::fprintf(stderr, "strata ascend: loaded %d / %d layers (%.1f s)\n", l + 1, NL, (now_ms() - t0) / 1000.0);
+                std::fprintf(stderr, "strata ascend: loaded MoE %d / %d layers (INT8_Cube=%d, Q2_0=%d, %.1f s)\n",
+                             l + 1, NL, n_int8_layers, n_q2_layers, (now_ms() - t0) / 1000.0);
                 std::fflush(stderr);
             }
         }
 
-        // Output HC + LM Head on final NPU
-        const int last_dev = n_npu_ - 1;
-        NpuCtx& lc = *npu_[last_dev];
-        if (!upload_f32_dev(last_dev, "output_hc_norm.weight", HCD, out_hc_norm_)) return false;
-        build_fused_kn_f16(map_base, HCD, W_HC_DN_COLS, {{f_.find("output_hc_down.weight"), 0, LR}}, h_kn, nth);
-        if (!W_out_hc_dn_.upload_and_format(last_dev, lc.stream, lc.ws.ptr, lc.ws.bytes, h_kn.data(), HCD, W_HC_DN_COLS, err)) return false;
+        // Release temporary packing vectors so host heap stays clean
+        h_w1_nz = {}; h_w2_nz = {}; h_w1_sc = {}; h_w2_sc = {}; h_qs = {}; h_d = {};
 
-        build_fused_kn_f16(map_base, LR, HCD, {{f_.find("output_hc_up.weight"), 0, HCD}}, h_kn, nth);
-        if (!W_out_hc_up_.upload_and_format(last_dev, lc.stream, lc.ws.ptr, lc.ws.bytes, h_kn.data(), LR, HCD, err)) return false;
-
-        // Pad any columns past n_vocab_ with -65504 (0xFBFF in FP16) so padded columns never win argmax
-        build_fused_kn_f16(map_base, N, vocab_pad_, {{t_out, 0, n_vocab_}}, h_kn, nth, 0xFBFFu);
-        if (!W_lm_head_.upload_and_format(last_dev, lc.stream, lc.ws.ptr, lc.ws.bytes, h_kn.data(), N, vocab_pad_, err) ||
-            !d_lm_f16_.alloc(last_dev, (size_t)MAXT * vocab_pad_ * 2, err) ||
-            !d_lm_f32_.alloc(last_dev, (size_t)MAXT * vocab_pad_ * 4, err) ||
-            !d_arg_pv_.alloc(last_dev, (size_t)MAXT * 64 * 4, err) ||
-            !d_arg_pi_.alloc(last_dev, (size_t)MAXT * 64 * 4, err) ||
-            !d_tok_out_.alloc(last_dev, 8 * 4, err)) {
+        // Allocate DMA-pinned host staging buffers
+        if (!h_R_.alloc((size_t)MAX_ROWS * HCD) ||
+            !h_bo_.alloc((size_t)MAX_ROWS * N) ||
+            !h_inj_.alloc((size_t)(MAX_ROWS * HC + 16)) ||
+            !h_ple_emb_.alloc((size_t)MAX_ROWS * N) ||
+            !h_ple_kv_f16_.alloc((size_t)MAX_ROWS * (HCD + N)) ||
+            !h_logits_f32_.alloc((size_t)MAXT * vocab_pad_) ||
+            !h_tok_buf_.alloc(8)) {
+            err = "ascend window: failed to allocate DMA-pinned host staging buffers";
             return false;
         }
 
-        h_R_.resize((size_t)MAX_ROWS * HCD);
-        h_bo_.resize((size_t)MAX_ROWS * N);
-        h_inj_.resize((size_t)(MAX_ROWS * HC + 16));
-        h_ple_emb_.resize((size_t)MAX_ROWS * N);
-        h_ple_kv_f16_.resize((size_t)MAX_ROWS * (HCD + N));
-        h_logits_f32_.resize((size_t)MAXT * vocab_pad_);
+        pin_host_thread_numa1();
 
         for (int d = 0; d < n_npu_; ++d) {
             size_t free_b = 0, total_b = 0;
             (void)aclrtSetDevice(d);
             (void)aclrtGetMemInfo(ACL_HBM_MEM, &free_b, &total_b);
-            std::fprintf(stderr, "strata ascend: NPU %d (%s) HBM used %.2f / %.2f GiB (%.2f GiB free)\n",
+            int d_i8 = 0, d_q2 = 0;
+            for (int l = 0; l < NL; ++l) {
+                if (layers_[(size_t)l].dev == d) {
+                    if (layers_[(size_t)l].use_int8_cube) ++d_i8;
+                    else ++d_q2;
+                }
+            }
+            const double used_g = (double)(total_b - free_b) / (1024.0 * 1024.0 * 1024.0);
+            const double tot_g  = (double)total_b / (1024.0 * 1024.0 * 1024.0);
+            std::fprintf(stderr, "strata ascend: NPU %d (%s) HBM used %.2f / %.2f GiB (%.1f%%, INT8_Cube=%d, Q2_0=%d)\n",
                          d, aclrtGetSocName() ? aclrtGetSocName() : "Ascend",
-                         (double)(total_b - free_b) / (1024.0 * 1024.0 * 1024.0),
-                         (double)total_b / (1024.0 * 1024.0 * 1024.0),
-                         (double)free_b / (1024.0 * 1024.0 * 1024.0));
+                         used_g, tot_g, tot_g > 0.0 ? (100.0 * used_g / tot_g) : 0.0, d_i8, d_q2);
         }
-        std::fprintf(stderr, "strata ascend: Qwen3.8-Flash-Next window ready in %.1f s (max_cells=%lld, PLE=%s)\n",
-                     (now_ms() - t0) / 1000.0, (long long)max_cells_, ple_on_ ? "on" : "off");
+        std::fprintf(stderr, "strata ascend: Qwen3.8-Flash-Next window ready in %.1f s (NPUs=%d, INT8_Cube=%d/%d, max_cells=%lld, PLE=%s)\n",
+                     (now_ms() - t0) / 1000.0, n_npu_, n_int8_layers, NL, (long long)max_cells_, ple_on_ ? "on" : "off");
         std::fflush(stderr);
         ready_ = true;
         return true;
@@ -854,17 +1347,14 @@ public:
         }
         if (!fold_pending(err)) return false;
 
-        // 1) Token embeddings on host -> broadcast across 4 HC streams -> upload to NPU 0
-        const gguf::Tensor* te = f_.find("token_embd.weight");
-        if (!te) { err = "ascend window: missing token_embd.weight"; return false; }
-        const size_t rb = ref::row_bytes(te->type, N);
-        const uint8_t* map_base = (const uint8_t*)f_.map;
+        // 1) Fast FP32 RAM token embeddings -> broadcast across 4 HC streams -> DMA-pinned H2D upload to NPU 0
         for (int t = 0; t < Tn; ++t) {
             float* r = h_R_.data() + (size_t)t * HCD;
             if (embd_rows && embd_rows[t]) {
                 std::memcpy(r, embd_rows[t], (size_t)N * 4);
             } else {
-                ref::dequant(te->type, map_base + te->offset + (size_t)tokens[t] * rb, r, N);
+                const int64_t tid = std::max<int64_t>(0, std::min<int64_t>(n_vocab_ - 1, tokens[t]));
+                std::memcpy(r, h_tok_embd_f32_.data() + (size_t)tid * N, (size_t)N * 4);
             }
             for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t)c * N, r, (size_t)N * 4);
         }
@@ -872,7 +1362,7 @@ public:
         NpuCtx& c0 = *npu_[0];
         if (!c0.R.upload(h_R_.data(), (size_t)Tn * HCD * 4, err)) return false;
 
-        // 2) Gather PLE n-gram rows on host & launch W_ple_kv Cube matmul on NPU 0
+        // 2) Gather PLE n-gram rows from locked Host RAM & launch W_ple_kv Cube matmul on NPU 0
         if (ple_on_) {
             std::vector<uint32_t> ple_rows((size_t)Tn * strata::kernels::PLE_N_HEADS);
             int32_t prev[2] = {ss_->ple_prev[0], ss_->ple_prev[1]};
@@ -893,22 +1383,23 @@ public:
         const uint32_t gdn_commit = (immediate_commit || Tn == 1) ? (uint32_t)Tn : 0u;
 
         for (int l = 0; l < NL; ++l) {
-            // Cross-NPU activation handoff at split_layer_
-            if (n_npu_ > 1 && l == split_layer_) {
-                if (!c0.sync(err)) return false;
+            const LayerWeights& lw = layers_[(size_t)l];
+            // Cross-NPU DMA-pinned activation handoff whenever pipeline stage transitions
+            if (l > 0 && lw.dev != layers_[(size_t)(l - 1)].dev) {
+                NpuCtx& prev_nc = *npu_[layers_[(size_t)(l - 1)].dev];
+                if (!prev_nc.sync(err)) return false;
                 const size_t r_bytes = (size_t)Tn * HCD * 4;
                 const size_t b_bytes = (size_t)Tn * N * 4;
                 const size_t i_bytes = (size_t)(((Tn * HC + 7) / 8) * 8) * 4;
-                if (!c0.R.download(h_R_.data(), r_bytes, err) ||
-                    !c0.bo_f32.download(h_bo_.data(), b_bytes, err) ||
-                    !c0.inj[cur_inj].download(h_inj_.data(), i_bytes, err)) return false;
-                NpuCtx& c1 = *npu_[1];
-                if (!c1.R.upload(h_R_.data(), r_bytes, err) ||
-                    !c1.bo_f32.upload(h_bo_.data(), b_bytes, err) ||
-                    !c1.inj[cur_inj].upload(h_inj_.data(), i_bytes, err)) return false;
+                if (!prev_nc.R.download(h_R_.data(), r_bytes, err) ||
+                    !prev_nc.bo_f32.download(h_bo_.data(), b_bytes, err) ||
+                    !prev_nc.inj[cur_inj].download(h_inj_.data(), i_bytes, err)) return false;
+                NpuCtx& next_nc = *npu_[lw.dev];
+                if (!next_nc.R.upload(h_R_.data(), r_bytes, err) ||
+                    !next_nc.bo_f32.upload(h_bo_.data(), b_bytes, err) ||
+                    !next_nc.inj[cur_inj].upload(h_inj_.data(), i_bytes, err)) return false;
             }
 
-            const LayerWeights& lw = layers_[(size_t)l];
             NpuCtx& nc = *npu_[lw.dev];
             if (!check_acl(aclrtSetDevice(lw.dev), "aclrtSetDevice", err)) return false;
 
@@ -939,7 +1430,6 @@ public:
                     lw.ssm_conv_w.ptr, lw.ssm_dt.ptr, lw.ssm_a.ptr, lw.ssm_norm.ptr,
                     nc.yg_f16.ptr, (uint32_t)Tn, gdn_commit, /*from_saved=*/0u, eps_);
                 if (!nc.mm(nc.yg_f16.ptr, lw.W_ssm_out, nc.bo_f16.ptr, Tn, err)) return false;
-                strata::ascend_ops::launch_f16_to_f32(nc.stream, nc.bo_f16.ptr, nc.bo_f32.ptr, (uint32_t)(Tn * N));
             } else {
                 const int qi = l / QI;
                 QsaLayerState& qs = qsa_states_[(size_t)qi];
@@ -962,13 +1452,12 @@ public:
                     nc.qids_i32.ptr, nc.xq_f16.ptr,
                     (uint32_t)pos0, (uint32_t)Tn);
                 if (!nc.mm(nc.xq_f16.ptr, lw.W_attn_out, nc.bo_f16.ptr, Tn, err)) return false;
-                strata::ascend_ops::launch_f16_to_f32(nc.stream, nc.bo_f16.ptr, nc.bo_f32.ptr, (uint32_t)(Tn * N));
             }
 
-            // ---- FFN Hyper-Connection Read ----
+            // ---- FFN Hyper-Connection Read (apply=2u fuses bo_f16 -> f32 directly in UB!) ----
             strata::ascend_ops::launch_gr_norm(
-                nc.stream, nc.R.ptr, nc.bo_f32.ptr, nc.inj[cur_inj].ptr, lw.hc_ffn_norm.ptr,
-                nc.xn_f32.ptr, nc.xn_f16.ptr, (uint32_t)Tn, /*apply=*/1u, eps_);
+                nc.stream, nc.R.ptr, nc.bo_f16.ptr, nc.inj[cur_inj].ptr, lw.hc_ffn_norm.ptr,
+                nc.xn_f32.ptr, nc.xn_f16.ptr, (uint32_t)Tn, /*apply=*/2u, eps_);
             if (!nc.mm(nc.xn_f16.ptr, lw.W_hc_ffn_dn, nc.hc_dn_f16.ptr, Tn, err)) return false;
             strata::ascend_ops::launch_gr_post_down(
                 nc.stream, nc.hc_dn_f16.ptr, nc.lo_f16.ptr, nc.inj[1 - cur_inj].ptr, (uint32_t)Tn);
@@ -977,31 +1466,49 @@ public:
                 nc.stream, nc.xn_f32.ptr, nc.gate_f16.ptr, nc.xf_f16.ptr, nc.xf_f32.ptr, (uint32_t)Tn);
             cur_inj = 1 - cur_inj;
 
-            // ---- MoE Sublayer (batched dense Cube + 8-row Q2_0 expert windows) ----
+            // ---- MoE Sublayer ----
             if (!nc.mm(nc.xf_f16.ptr, lw.W_moe_in, nc.moe_in_f16.ptr, Tn, err)) return false;
-            for (int t0 = 0; t0 < Tn; t0 += MAXT) {
-                const int sub = std::min(MAXT, Tn - t0);
-                uint8_t* p_moe_in = (uint8_t*)nc.moe_in_f16.ptr + (size_t)t0 * MOE_IN_COLS * 2;
-                uint8_t* p_sh_h   = (uint8_t*)nc.sh_h_f16.ptr   + (size_t)t0 * NFF * 2;
-                uint8_t* p_xf     = (uint8_t*)nc.xf_f32.ptr     + (size_t)t0 * N * 4;
-                uint8_t* p_ysh    = (uint8_t*)nc.ysh_f16.ptr    + (size_t)t0 * N * 2;
-                uint8_t* p_bo     = (uint8_t*)nc.bo_f32.ptr     + (size_t)t0 * N * 4;
+            if (lw.use_int8_cube) {
+                // Full-batch 280-TOPS INT8 FRACTAL_NZ Cube MoE pass (handles Tn = 1..256 -> M = 10..2560 in ONE call!)
+                const uint32_t M_moe = (uint32_t)(Tn * TOPK);
+                strata::ascend_ops::launch_moe_route_cube(
+                    nc.stream, nc.moe_in_f16.ptr, nc.ids_i32.ptr, nc.wts_f32.ptr, nc.sh_h_f16.ptr,
+                    nc.group_cumsum_i64.ptr, nc.sorted_tok_i32.ptr, nc.tok_perm_i32.ptr,
+                    (uint32_t)Tn, (uint32_t)nexp_);
+                if (!nc.mm(nc.sh_h_f16.ptr, lw.W_shexp_down, nc.ysh_f16.ptr, Tn, err)) return false;
+                strata::ascend_ops::launch_moe_gather_x(
+                    nc.stream, nc.xf_f16.ptr, nc.sorted_tok_i32.ptr, nc.sorted_x_f16.ptr, (uint32_t)Tn, M_moe);
+                if (!nc.qgm(nc.sorted_x_f16.ptr, lw.W_moe_w1, nc.moe_gu_f16.ptr, (int64_t)M_moe, err)) return false;
+                strata::ascend_ops::launch_moe_swiglu_f16(nc.stream, nc.moe_gu_f16.ptr, nc.moe_h_f16.ptr, M_moe);
+                if (!nc.qgm(nc.moe_h_f16.ptr, lw.W_moe_w2, nc.moe_ye_f16.ptr, (int64_t)M_moe, err)) return false;
+                strata::ascend_ops::launch_moe_combine_f16(
+                    nc.stream, nc.moe_ye_f16.ptr, nc.tok_perm_i32.ptr, nc.wts_f32.ptr,
+                    nc.ysh_f16.ptr, nc.bo_f32.ptr, (uint32_t)Tn, M_moe);
+            } else {
+                // Fallback planar Q2_0 path in 8-row windows
+                for (int t0 = 0; t0 < Tn; t0 += MAXT) {
+                    const int sub = std::min(MAXT, Tn - t0);
+                    uint8_t* p_moe_in = (uint8_t*)nc.moe_in_f16.ptr + (size_t)t0 * MOE_IN_COLS * 2;
+                    uint8_t* p_sh_h   = (uint8_t*)nc.sh_h_f16.ptr   + (size_t)t0 * NFF * 2;
+                    uint8_t* p_xf     = (uint8_t*)nc.xf_f32.ptr     + (size_t)t0 * N * 4;
+                    uint8_t* p_ysh    = (uint8_t*)nc.ysh_f16.ptr    + (size_t)t0 * N * 2;
+                    uint8_t* p_bo     = (uint8_t*)nc.bo_f32.ptr     + (size_t)t0 * N * 4;
 
-                strata::ascend_ops::launch_moe_route_shexp(
-                    nc.stream, p_moe_in, nc.ids_i32.ptr, nc.wts_f32.ptr, nc.plan_i32.ptr,
-                    p_sh_h, nc.sg_f32.ptr, (uint32_t)sub, (uint32_t)nexp_);
-                if (!nc.mm(p_sh_h, lw.W_shexp_down, p_ysh, sub, err)) return false;
-                strata::ascend_ops::launch_moe_q2_gu(
-                    nc.stream, lw.gu_qs.ptr, lw.gu_d.ptr, p_xf, nc.plan_i32.ptr, nc.h_f32.ptr, (uint32_t)sub);
-                strata::ascend_ops::launch_moe_q2_down(
-                    nc.stream, lw.down_qs.ptr, lw.down_d.ptr, nc.h_f32.ptr, nc.plan_i32.ptr, nc.ye_f32.ptr);
-                strata::ascend_ops::launch_moe_combine(
-                    nc.stream, nc.ye_f32.ptr, nc.plan_i32.ptr, p_ysh, nc.sg_f32.ptr, p_bo, (uint32_t)sub);
+                    strata::ascend_ops::launch_moe_route_shexp(
+                        nc.stream, p_moe_in, nc.ids_i32.ptr, nc.wts_f32.ptr, nc.plan_i32.ptr,
+                        p_sh_h, nc.sg_f32.ptr, (uint32_t)sub, (uint32_t)nexp_);
+                    if (!nc.mm(p_sh_h, lw.W_shexp_down, p_ysh, sub, err)) return false;
+                    strata::ascend_ops::launch_moe_q2_gu(
+                        nc.stream, lw.gu_qs.ptr, lw.gu_d.ptr, p_xf, nc.plan_i32.ptr, nc.h_f32.ptr, (uint32_t)sub);
+                    strata::ascend_ops::launch_moe_q2_down(
+                        nc.stream, lw.down_qs.ptr, lw.down_d.ptr, nc.h_f32.ptr, nc.plan_i32.ptr, nc.ye_f32.ptr);
+                    strata::ascend_ops::launch_moe_combine(
+                        nc.stream, nc.ye_f32.ptr, nc.plan_i32.ptr, p_ysh, nc.sg_f32.ptr, p_bo, (uint32_t)sub);
+                }
             }
 
             // ---- PLE Block after Layer 0 ----
             if (l == 0 && ple_on_) {
-                // Apply Layer 0's pending FFN write to R on NPU 0 before PLE
                 strata::ascend_ops::launch_gr_norm(
                     c0.stream, c0.R.ptr, c0.bo_f32.ptr, c0.inj[cur_inj].ptr, layers_[1].hc_attn_norm.ptr,
                     c0.xn_f32.ptr, c0.xn_f16.ptr, (uint32_t)Tn, /*apply=*/1u, eps_);
@@ -1040,11 +1547,10 @@ public:
         }
 
         if (head) {
-            int32_t tok_buf[8] = {};
-            if (!d_tok_out_.download(tok_buf, 8 * 4, err)) return false;
+            if (!d_tok_out_.download(h_tok_buf_.data(), 8 * 4, err)) return false;
             for (int t = 0; t < Tn; ++t) {
-                tok_out_[t] = tok_buf[t];
-                if (out) out[t] = tok_buf[t];
+                tok_out_[t] = h_tok_buf_[(size_t)t];
+                if (out) out[t] = h_tok_buf_[(size_t)t];
             }
         } else if (out) {
             for (int t = 0; t < Tn; ++t) out[t] = -1;
@@ -1141,30 +1647,37 @@ public:
     bool checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& err) {
         if (!fold_pending(err)) return false;
         const size_t gs_b = (size_t)HV * SS * SS * 4;
-        const size_t hs_b = (size_t)CONV * 4 * 4;
+        const size_t hs_b = (size_t)CONV * 3 * 4; // Strata shared contract: 3 active conv taps per channel
         c.gdn.resize(gdn_states_.size() * (gs_b + hs_b));
+        std::vector<float> h4((size_t)CONV * 4);
         for (size_t i = 0; i < gdn_states_.size(); ++i) {
             uint8_t* dst = c.gdn.data() + i * (gs_b + hs_b);
             if (!gdn_states_[i].state.download(dst, gs_b, err) ||
-                !gdn_states_[i].hist[hp_].download(dst + gs_b, hs_b, err)) return false;
+                !gdn_states_[i].hist[hp_].download(h4.data(), h4.size() * 4, err)) return false;
+            float* dst_h = reinterpret_cast<float*>(dst + gs_b);
+            for (int ch = 0; ch < CONV; ++ch) {
+                dst_h[(size_t)ch * 3 + 0] = h4[(size_t)ch * 4 + 0];
+                dst_h[(size_t)ch * 3 + 1] = h4[(size_t)ch * 4 + 1];
+                dst_h[(size_t)ch * 3 + 2] = h4[(size_t)ch * 4 + 2];
+            }
         }
         c.ple.resize(ple_hist_.size() * 4);
         std::memcpy(c.ple.data(), ple_hist_.data(), c.ple.size());
-        const size_t ts_b = 4 * ID * 4, ds_b = ID * 4;
+        const size_t ts_b = 3 * ID * 4, ds_b = ID * 4; // Strata shared contract: rows 0..2 of the 4-row ring
         c.tails.resize(qsa_states_.size() * ts_b);
         c.dead.resize(qsa_states_.size() * ds_b);
         for (size_t j = 0; j < qsa_states_.size(); ++j) {
             if (!qsa_states_[j].tail.download(c.tails.data() + j * ts_b, ts_b, err) ||
                 !qsa_states_[j].dead.download(c.dead.data() + j * ds_b, ds_b, err)) return false;
         }
-        c.block_pos.assign(qsa_states_.size() * 4, 0);
+        c.block_pos.assign(qsa_states_.size() * sizeof(int32_t), 0);
         return true;
     }
 
     bool checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& err) {
         const size_t gs_b = (size_t)HV * SS * SS * 4;
-        const size_t hs_b = (size_t)CONV * 4 * 4;
-        const size_t ts_b = 4 * ID * 4, ds_b = ID * 4;
+        const size_t hs_b = (size_t)CONV * 3 * 4;
+        const size_t ts_b = 3 * ID * 4, ds_b = ID * 4;
         if (c.gdn.size() != gdn_states_.size() * (gs_b + hs_b) ||
             c.ple.size() != ple_hist_.size() * 4 ||
             c.tails.size() != qsa_states_.size() * ts_b ||
@@ -1174,14 +1687,24 @@ public:
         }
         pend_fold_ = 0;
         last_T_ = 0;
+        std::vector<float> h4((size_t)CONV * 4, 0.0f);
         for (size_t i = 0; i < gdn_states_.size(); ++i) {
             const uint8_t* src = c.gdn.data() + i * (gs_b + hs_b);
+            const float* src_h = reinterpret_cast<const float*>(src + gs_b);
+            for (int ch = 0; ch < CONV; ++ch) {
+                h4[(size_t)ch * 4 + 0] = src_h[(size_t)ch * 3 + 0];
+                h4[(size_t)ch * 4 + 1] = src_h[(size_t)ch * 3 + 1];
+                h4[(size_t)ch * 4 + 2] = src_h[(size_t)ch * 3 + 2];
+                h4[(size_t)ch * 4 + 3] = 0.0f;
+            }
             if (!gdn_states_[i].state.upload(src, gs_b, err) ||
-                !gdn_states_[i].hist[hp_].upload(src + gs_b, hs_b, err)) return false;
+                !gdn_states_[i].hist[hp_].upload(h4.data(), h4.size() * 4, err)) return false;
         }
         std::memcpy(ple_hist_.data(), c.ple.data(), c.ple.size());
+        std::vector<float> t4(4 * ID, 0.0f);
         for (size_t j = 0; j < qsa_states_.size(); ++j) {
-            if (!qsa_states_[j].tail.upload(c.tails.data() + j * ts_b, ts_b, err) ||
+            std::memcpy(t4.data(), c.tails.data() + j * ts_b, ts_b);
+            if (!qsa_states_[j].tail.upload(t4.data(), t4.size() * 4, err) ||
                 !qsa_states_[j].dead.upload(c.dead.data() + j * ds_b, ds_b, err)) return false;
         }
         return true;
@@ -1328,7 +1851,6 @@ private:
                               });
             cand.resize(kk);
 
-            // Softmax pre-temperature for top_p & min_p filters
             float mx = cand[0].first;
             std::vector<float> p(kk);
             float psum = 0.0f;
@@ -1360,7 +1882,6 @@ private:
                 }
             }
 
-            // Temperature scaling + Philox draw
             const float inv_t = 1.0f / sp.temperature;
             float mx_t = cand[0].first * inv_t;
             float tsum = 0.0f;
@@ -1389,7 +1910,6 @@ private:
     gguf::File f_;
 
     int n_npu_ = 1;
-    int split_layer_ = NL;
     int max_t_ = 1;
     int nexp_ = NEXP;
     int64_t max_cells_ = 0;
@@ -1398,6 +1918,7 @@ private:
     int64_t vocab_pad_ = 0;
     float eps_ = 1e-6f;
 
+    std::vector<float> h_tok_embd_f32_;
     std::vector<std::unique_ptr<NpuCtx>> npu_;
     std::vector<LayerWeights> layers_;
     std::vector<GdnState> gdn_states_;
@@ -1413,8 +1934,9 @@ private:
     NzMat W_out_hc_dn_, W_out_hc_up_, W_lm_head_;
     DevMem d_lm_f16_, d_lm_f32_, d_arg_pv_, d_arg_pi_, d_tok_out_;
 
-    std::vector<float> h_R_, h_bo_, h_inj_, h_ple_emb_, h_logits_f32_;
-    std::vector<uint16_t> h_ple_kv_f16_;
+    HostPinned<float> h_R_, h_bo_, h_inj_, h_ple_emb_, h_logits_f32_;
+    HostPinned<uint16_t> h_ple_kv_f16_;
+    HostPinned<int32_t> h_tok_buf_;
 
     int hp_ = 0;
     int pend_fold_ = 0;

@@ -4,6 +4,7 @@
 
 #include "acl/acl.h"
 #include "aclnnop/aclnn_mm.h"
+#include "aclnnop/aclnn_quant_grouped_matmul_dequant_weight_nz.h"
 #include "aclnnop/aclnn_trans_matmul_weight.h"
 
 #include <algorithm>
@@ -694,7 +695,192 @@ int main() {
         if (!ok) return 1;
     }
 
-    std::printf("ALL 7 ASCEND PARITY SUITES PASSED!\n");
+    // ------------------------------------------------------------------------
+    // 8. INT8 FRACTAL_NZ 280-TOPS Cube MoE Pipeline (T=16, M=160, E=32)
+    // ------------------------------------------------------------------------
+    {
+        const uint32_t T = 16, NEXP = 32, N = 2560, NFF = 640, GU = 1280, INSTR = 1808, TOPK = 10;
+        const uint32_t M = T * TOPK; // 160 (> P_MAXE=128, exercising full batched Cube MoE!)
+        std::vector<uint16_t> hMoeIn(T * INSTR), hYsh(T * N), hXf16(T * N);
+        std::vector<float> hXf(T * N);
+        for (auto& v : hMoeIn) v = ref::f32_to_f16(rng.sym() * 1.2f);
+        for (auto& v : hYsh)   v = ref::f32_to_f16(rng.sym() * 0.4f);
+        for (uint32_t i = 0; i < T * N; ++i) {
+            uint16_t h = ref::f32_to_f16(rng.sym() * 0.5f);
+            hXf16[i] = h;
+            hXf[i] = ref::f16_to_f32(h);
+        }
+
+        const size_t gu_row_bytes = (N / 64) * 18;
+        const size_t dn_row_bytes = (NFF / 64) * 18;
+        std::vector<uint8_t> raw_gate(NEXP * NFF * gu_row_bytes), raw_up(NEXP * NFF * gu_row_bytes), raw_down(NEXP * N * dn_row_bytes);
+        ref::random_blocks(ref::Q2_0, raw_gate.data(), NEXP * NFF, N, 505ULL, 0.04f);
+        ref::random_blocks(ref::Q2_0, raw_up.data(),   NEXP * NFF, N, 606ULL, 0.04f);
+        ref::random_blocks(ref::Q2_0, raw_down.data(), NEXP * N, NFF, 707ULL, 0.04f);
+
+        // Pack Q2_0 -> INT8 FRACTAL_NZ [E, K/32, N_out/16, 16, 32] + FP32 scale [E, N_out] on CPU
+        std::vector<int8_t> w1_nz((size_t)NEXP * N * GU);
+        std::vector<float>  w1_sc((size_t)NEXP * GU);
+        std::vector<int8_t> w2_nz((size_t)NEXP * NFF * N);
+        std::vector<float>  w2_sc((size_t)NEXP * N);
+        std::vector<float> row_f32(N);
+        std::vector<int8_t> row_i8(N);
+
+        auto pack_row_nz = [](int8_t* dst_nz, uint32_t e, uint32_t r, uint32_t N_out, uint32_t K, const int8_t* src_i8) {
+            uint32_t r_hi = r >> 4, r_lo = r & 15u;
+            uint32_t n_blocks = N_out >> 4, k_blocks = K >> 5;
+            for (uint32_t kh = 0; kh < k_blocks; ++kh) {
+                size_t off = ((((size_t)e * k_blocks + kh) * n_blocks + r_hi) * 16 + r_lo) * 32;
+                std::memcpy(dst_nz + off, src_i8 + kh * 32, 32);
+            }
+        };
+
+        for (uint32_t e = 0; e < NEXP; ++e) {
+            for (uint32_t mat = 0; mat < 2; ++mat) {
+                const uint8_t* src = (mat == 0 ? raw_gate.data() : raw_up.data()) + (size_t)e * NFF * gu_row_bytes;
+                for (uint32_t r = 0; r < NFF; ++r) {
+                    ref::dequant(ref::Q2_0, src + r * gu_row_bytes, row_f32.data(), N);
+                    float mx = 0.0f;
+                    for (uint32_t k = 0; k < N; ++k) mx = std::max(mx, std::fabs(row_f32[k]));
+                    float sc = mx > 0.0f ? (mx / 127.0f) : 1.0f;
+                    uint32_t out_r = mat * NFF + r;
+                    w1_sc[(size_t)e * GU + out_r] = sc;
+                    for (uint32_t k = 0; k < N; ++k)
+                        row_i8[k] = (int8_t)std::clamp((int)std::nearbyintf(row_f32[k] / sc), -127, 127);
+                    pack_row_nz(w1_nz.data(), e, out_r, GU, N, row_i8.data());
+                }
+            }
+            const uint8_t* dsrc = raw_down.data() + (size_t)e * N * dn_row_bytes;
+            for (uint32_t r = 0; r < N; ++r) {
+                ref::dequant(ref::Q2_0, dsrc + r * dn_row_bytes, row_f32.data(), NFF);
+                float mx = 0.0f;
+                for (uint32_t k = 0; k < NFF; ++k) mx = std::max(mx, std::fabs(row_f32[k]));
+                float sc = mx > 0.0f ? (mx / 127.0f) : 1.0f;
+                w2_sc[(size_t)e * N + r] = sc;
+                for (uint32_t k = 0; k < NFF; ++k)
+                    row_i8[k] = (int8_t)std::clamp((int)std::nearbyintf(row_f32[k] / sc), -127, 127);
+                pack_row_nz(w2_nz.data(), e, r, N, NFF, row_i8.data());
+            }
+        }
+
+        DevBuf dMoeIn(T * INSTR * 2), dIds(T * 16 * 4), dWts(T * 16 * 4), dShH(T * NFF * 2);
+        DevBuf dCum(512 * 8), dSort(((M + 7) / 8) * 8 * 4), dPerm(T * 16 * 4);
+        DevBuf dXf16(T * N * 2), dSortX(M * N * 2), dGu16(M * GU * 2), dH16(M * NFF * 2), dYe16(M * N * 2);
+        DevBuf dW1(w1_nz.size()), dS1(w1_sc.size() * 4), dW2(w2_nz.size()), dS2(w2_sc.size() * 4);
+        DevBuf dYsh(T * N * 2), dBo(T * N * 4), dWs(64 * 1024 * 1024);
+
+        dMoeIn.upload(hMoeIn.data(), hMoeIn.size() * 2);
+        dXf16.upload(hXf16.data(), hXf16.size() * 2);
+        dW1.upload(w1_nz.data(), w1_nz.size());
+        dS1.upload(w1_sc.data(), w1_sc.size() * 4);
+        dW2.upload(w2_nz.data(), w2_nz.size());
+        dS2.upload(w2_sc.data(), w2_sc.size() * 4);
+        dYsh.upload(hYsh.data(), hYsh.size() * 2);
+
+        strata::ascend_ops::launch_moe_route_cube(
+            stream, dMoeIn.ptr, dIds.ptr, dWts.ptr, dShH.ptr, dCum.ptr, dSort.ptr, dPerm.ptr, T, NEXP);
+        strata::ascend_ops::launch_moe_gather_x(stream, dXf16.ptr, dSort.ptr, dSortX.ptr, T, M);
+
+        int64_t x1Dim[2] = {M, N}, x1Str[2] = {N, 1};
+        int64_t w1View[3] = {NEXP, GU, N}, w1Str[3] = {GU * N, N, 1}, w1Stor[5] = {NEXP, N / 32, GU / 16, 16, 32};
+        int64_t s1Dim[2] = {NEXP, GU}, s1Str[2] = {GU, 1};
+        int64_t gDim[1]  = {NEXP}, gStr[1] = {1};
+        int64_t o1Dim[2] = {M, GU}, o1Str[2] = {GU, 1};
+        aclTensor* tX1 = aclCreateTensor(x1Dim, 2, ACL_FLOAT16, x1Str, 0, ACL_FORMAT_ND, x1Dim, 2, dSortX.ptr);
+        aclTensor* tW1 = aclCreateTensor(w1View, 3, ACL_INT8, w1Str, 0, ACL_FORMAT_FRACTAL_NZ, w1Stor, 5, dW1.ptr);
+        aclTensor* tS1 = aclCreateTensor(s1Dim, 2, ACL_FLOAT, s1Str, 0, ACL_FORMAT_ND, s1Dim, 2, dS1.ptr);
+        aclTensor* tG  = aclCreateTensor(gDim, 1, ACL_INT64, gStr, 0, ACL_FORMAT_ND, gDim, 1, dCum.ptr);
+        aclTensor* tO1 = aclCreateTensor(o1Dim, 2, ACL_FLOAT16, o1Str, 0, ACL_FORMAT_ND, o1Dim, 2, dGu16.ptr);
+
+        char qmode[] = "pertoken";
+        uint64_t ws1 = 0, ws2 = 0;
+        aclOpExecutor *ex1 = nullptr, *ex2 = nullptr;
+        ACL_CHECK(aclnnQuantGroupedMatmulDequantWeightNZGetWorkspaceSize(
+            tX1, tW1, tS1, tG, nullptr, nullptr, nullptr, nullptr, qmode, true, tO1, &ws1, &ex1));
+        ACL_CHECK(aclnnQuantGroupedMatmulDequantWeightNZ(dWs.ptr, ws1, ex1, stream));
+
+        strata::ascend_ops::launch_moe_swiglu_f16(stream, dGu16.ptr, dH16.ptr, M);
+
+        int64_t x2Dim[2] = {M, NFF}, x2Str[2] = {NFF, 1};
+        int64_t w2View[3] = {NEXP, N, NFF}, w2Str[3] = {N * NFF, NFF, 1}, w2Stor[5] = {NEXP, NFF / 32, N / 16, 16, 32};
+        int64_t s2Dim[2] = {NEXP, N}, s2Str[2] = {N, 1};
+        int64_t o2Dim[2] = {M, N}, o2Str[2] = {N, 1};
+        aclTensor* tX2 = aclCreateTensor(x2Dim, 2, ACL_FLOAT16, x2Str, 0, ACL_FORMAT_ND, x2Dim, 2, dH16.ptr);
+        aclTensor* tW2 = aclCreateTensor(w2View, 3, ACL_INT8, w2Str, 0, ACL_FORMAT_FRACTAL_NZ, w2Stor, 5, dW2.ptr);
+        aclTensor* tS2 = aclCreateTensor(s2Dim, 2, ACL_FLOAT, s2Str, 0, ACL_FORMAT_ND, s2Dim, 2, dS2.ptr);
+        aclTensor* tO2 = aclCreateTensor(o2Dim, 2, ACL_FLOAT16, o2Str, 0, ACL_FORMAT_ND, o2Dim, 2, dYe16.ptr);
+
+        ACL_CHECK(aclnnQuantGroupedMatmulDequantWeightNZGetWorkspaceSize(
+            tX2, tW2, tS2, tG, nullptr, nullptr, nullptr, nullptr, qmode, true, tO2, &ws2, &ex2));
+        ACL_CHECK(aclnnQuantGroupedMatmulDequantWeightNZ(dWs.ptr, ws2, ex2, stream));
+
+        strata::ascend_ops::launch_moe_combine_f16(stream, dYe16.ptr, dPerm.ptr, dWts.ptr, dYsh.ptr, dBo.ptr, T, M);
+        ACL_CHECK(aclrtSynchronizeStream(stream));
+
+        aclDestroyTensor(tX1); aclDestroyTensor(tW1); aclDestroyTensor(tS1); aclDestroyTensor(tG); aclDestroyTensor(tO1);
+        aclDestroyTensor(tX2); aclDestroyTensor(tW2); aclDestroyTensor(tS2); aclDestroyTensor(tO2);
+
+        std::vector<float> gotBo(T * N), refBo(T * N, 0.0f);
+        dBo.download(gotBo.data(), T * N * 4);
+
+        // CPU FP32 golden reference using original Q2_0 blocks
+        std::vector<float> wG(NFF * N), wU(NFF * N), wD(N * NFF);
+        for (uint32_t t = 0; t < T; ++t) {
+            const uint16_t* min_row = hMoeIn.data() + t * INSTR;
+            std::vector<float> probs(NEXP);
+            float mx = -1e30f;
+            for (uint32_t e = 0; e < NEXP; ++e) { probs[e] = ref::f16_to_f32(min_row[e]); mx = std::max(mx, probs[e]); }
+            float sum = 0.0f;
+            for (uint32_t e = 0; e < NEXP; ++e) { probs[e] = std::exp(probs[e] - mx); sum += probs[e]; }
+            for (uint32_t e = 0; e < NEXP; ++e) probs[e] /= sum;
+
+            uint32_t top_e[TOPK]; float top_w[TOPK]; float ssum = 0.0f;
+            for (uint32_t r = 0; r < TOPK; ++r) {
+                uint32_t be = 0; float bv = -1e30f;
+                for (uint32_t e = 0; e < NEXP; ++e) if (probs[e] > bv) { bv = probs[e]; be = e; }
+                probs[be] = -1e30f;
+                top_e[r] = be; top_w[r] = bv; ssum += bv;
+            }
+            float denom = std::max(ssum, 6.103515625e-05f);
+            for (uint32_t r = 0; r < TOPK; ++r) top_w[r] /= denom;
+
+            float gs = sigmoid_f(ref::f16_to_f32(min_row[512 + 2 * NFF]));
+            for (uint32_t d = 0; d < N; ++d) refBo[t * N + d] = ref::f16_to_f32(hYsh[t * N + d]) * gs;
+
+            const float* x = hXf.data() + t * N;
+            for (uint32_t r = 0; r < TOPK; ++r) {
+                uint32_t e = top_e[r];
+                ref::dequant(ref::Q2_0, raw_gate.data() + (size_t)e * NFF * gu_row_bytes, wG.data(), NFF * N);
+                ref::dequant(ref::Q2_0, raw_up.data()   + (size_t)e * NFF * gu_row_bytes, wU.data(), NFF * N);
+                ref::dequant(ref::Q2_0, raw_down.data() + (size_t)e * N * dn_row_bytes,   wD.data(), N * NFF);
+                float h[NFF];
+                for (uint32_t i = 0; i < NFF; ++i) {
+                    float g = 0.0f, u = 0.0f;
+                    for (uint32_t k = 0; k < N; ++k) { g += wG[i * N + k] * x[k]; u += wU[i * N + k] * x[k]; }
+                    h[i] = silu_f(g) * u;
+                }
+                for (uint32_t d = 0; d < N; ++d) {
+                    float y = 0.0f;
+                    for (uint32_t i = 0; i < NFF; ++i) y += wD[d * NFF + i] * h[i];
+                    refBo[t * N + d] += y * top_w[r];
+                }
+            }
+        }
+
+        double dot = 0.0, ng = 0.0, nr = 0.0;
+        for (size_t i = 0; i < T * N; ++i) {
+            dot += (double)gotBo[i] * (double)refBo[i];
+            ng  += (double)gotBo[i] * (double)gotBo[i];
+            nr  += (double)refBo[i] * (double)refBo[i];
+        }
+        double cos_sim = dot / (std::sqrt(ng) * std::sqrt(nr) + 1e-30);
+        auto mc = compare_f32(gotBo.data(), refBo.data(), T * N);
+        std::printf("[8] moe_int8_cube (T=16, M=160): cos_sim=%.6f max_abs=%.3e rmse=%.3e %s\n",
+                    cos_sim, mc.max_abs, mc.mse, (cos_sim > 0.999 && mc.max_abs < 5e-2f) ? "PASS" : "FAIL");
+        if (cos_sim <= 0.999 || mc.max_abs >= 5e-2f) return 1;
+    }
+
+    std::printf("ALL 8 ASCEND PARITY SUITES PASSED!\n");
     ACL_CHECK(aclrtDestroyStream(stream));
     ACL_CHECK(aclrtResetDevice(0));
     ACL_CHECK(aclFinalize());

@@ -5,19 +5,25 @@ same way `metal/` and `sycl/` sit beside the CUDA and HIP trees without touching
 
 ## Architecture
 
-- **Cube Cores (`aclnnMm` + `FRACTAL_NZ`)**: Every dense projection in `Qwen3.8-Flash-Next` (hyper-connection down,
-  inject, and up matrices, fused GDN input `[2560, 16480]` and `ssm_out`, fused QSA input `[2560, 13952]` and
-  `attn_output`, MoE router + shared expert projections, layer-1 PLE `key`/`value`, and the `248,320`-row output head)
-  is dequantized once at startup with a `32x32` L1-tiled transpose and converted in-place to `ACL_FORMAT_FRACTAL_NZ` via
-  `aclnnTransMatmulWeight`.
-- **8 AI Cores (`ascend/src/kernels/ascend_ops.asc`, `dav-m200`)**: Custom Ascend C kernels implement FP32/FP16 casts,
-  hyper-connection RMSNorm and vectorized `PIPE_V` gating, fused 48-head GDN conv1d + L2 norm + `128x128` delta-rule
-  recurrence (both verify and fold passes), QSA RoPE + `INT8` KV quantization + exact 4-pass radix-256 block top-k
-  (`2,051` budget) + online softmax attention, MoE top-10 routing, planar `Q2_0` bit-plane unpacking + `PIPE_V`
-  `BlockReduceSum` expert GEMVs, and 8-core FP16 vocabulary argmax.
-- **Automatic 2-NPU Pipeline Split**: When two or more Ascend NPUs are visible, NPU 0 holds PLE + layers `0..23` and
-  NPU 1 holds layers `24..47` + `output_hc` + `output.weight` (`STRATA_ASCEND_SINGLE_NPU=1` forces 1 NPU). Only the
-  residual stream (`~50 KB` per token) crosses host staging at layer 24.
+- **280-TOPS `INT8 FRACTAL_NZ` Grouped Cube MoE (`aclnnQuantGroupedMatmulDequantWeightNZ`)**: At startup, a two-pass
+  loader allocates all dense matrices, `128K` KV/GDN states, and the output head first, then automatically fills up to
+  `~98%` of every visible NPU's HBM with `INT8 FRACTAL_NZ` (`[E, K/32, N/16, 16, 32]`) routed expert weights (`E = 512`,
+  `top_k = 10`, dynamic per-token activation quantization, FP32 per-channel scales). Any remaining tail layers fall back
+  cleanly to 8-core vectorized planar `Q2_0`. Full `256`-token prompt chunks (`M = 2,560` routed rows) run in one
+  grouped Cube pass per layer.
+- **FP16 `FRACTAL_NZ` Dense Cube Projections (`aclnnMm`)**: Hyper-connection down/inject/up matrices, fused GDN input
+  `[2560, 16480]` and `ssm_out`, fused QSA input `[2560, 13952]` and `attn_output`, MoE router + shared expert
+  projections, layer-1 PLE `key`/`value`, and the `248,320`-row output head run on the DaVinci FP16 Cube Cores.
+- **8 AI Cores (`ascend/src/kernels/ascend_ops.asc`, `dav-m200`)**: Custom Ascend C kernels implement hyper-connection
+  RMSNorm (with fused FP16 residual cast) and `PIPE_V` gating, 4-way ILP 48-head GDN conv1d + L2 norm + `128x128`
+  delta-rule recurrence, QSA RoPE + `INT8` KV quantization + `PIPE_V` block scoring + exact 4-pass radix-256 top-k
+  (`2,051` budget) + 16-cell Flash-Block online softmax attention, 8-core `PIPE_V` MoE routing + SwiGLU + combine,
+  planar `Q2_0` fallback GEMVs, and 8-core FP16 vocabulary argmax.
+- **Multi-NPU Pipeline (`1..8` NPUs) & Host RAM Hot Tier**: Layers split evenly across all visible NPUs
+  (`STRATA_ASCEND_SINGLE_NPU=1` or `STRATA_ASCEND_MAX_NPUS=N` overrides), passing `~50 KB` per token across stages via
+  DMA-pinned host buffers (`aclrtMallocHost`) on NUMA-local CPUs. Pre-packed `FRACTAL_NZ` weights and FP32 token
+  embeddings cache in `/dev/shm/chaomei_strata_nz` (`STRATA_ASCEND_CACHE_DIR=off` disables), alongside `--ple-io ram`
+  for the `26.8 GiB` PLE n-gram table.
 
 ### `dav-m200` (`Ascend 310P3`) ISA Notes
 
@@ -25,10 +31,12 @@ Verified on `Ascend 310P3` with CANN `9.1.0` (`bisheng` clang 15.0.5):
 
 1. `AscendC::Cast(half, float, ...)` requires `AscendC::RoundMode::CAST_NONE`; `CAST_RINT` is a silent no-op on
    `dav-m200`.
-2. `AscendC::ShiftRight` on `uint16_t` is a silent no-op on `dav-m200`. Planar `Q2_0` unpacking therefore masks the
-   four 2-bit planes directly with `{0x0303, 0x0C0C, 0x3030, 0xC0C0}`, casts `uint8_t -> half -> float`, adds
-   `{-1, -4, -16, -64}`, and pre-scales deinterleaved activations by `{1, 1/4, 1/16, 1/64}` before `BlockReduceSum`.
-3. Direct `uint32_t -> float` scalar casts fail AICore codegen; cast through `int32_t` first.
+2. `AscendC::ShiftRight` on `uint16_t` is a silent no-op on `dav-m200`. Planar `Q2_0` unpacking masks the four 2-bit
+   planes with `{0x0303, 0x0C0C, 0x3030, 0xC0C0}`, casts `uint8_t -> half -> float`, adds `{-1, -4, -16, -64}`, and
+   pre-scales deinterleaved activations by `{1, 1/4, 1/16, 1/64}` before `BlockReduceSum`.
+3. `aclnnQuantGroupedMatmulDequantWeightNZ` expects `ACL_FORMAT_FRACTAL_NZ` of logical `[E, N, K]` (`transposeWeight =
+   true`), whose physical storage layout `[E, K/32, N/16, 16, 32]` matches CPU `view(E, N/16, 16, K/32, 32).permute(0,
+   3, 1, 2, 4)` byte-for-byte.
 
 ## Building
 
@@ -41,24 +49,30 @@ ninja -C build-ascend ascend_parity_test strata
 ./build-ascend/ascend_parity_test
 ```
 
-## Measured Numbers (`2x Huawei Atlas 300V Pro / Ascend 310P3`, Kunpeng 920)
+## Measured Numbers (`3x Huawei Atlas 300V Pro / Ascend 310P3`, Kunpeng 920)
 
-Measured on Huawei TaiShan 200 2280 (`2x Kunpeng 920 5220`, 64 cores @ 2.6 GHz, 768 GB DDR4-2933) with two `48 GB`
-`Atlas 300V Pro` (`Ascend 310P3`, driver `26.0.rc1`, CANN `9.1.0`) running
-`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (`Q2_0`, `32K` context, `PLE=on`, no MTP drafter):
+Measured on Huawei TaiShan 200 2280 (`2x Kunpeng 920 5220`, 64 cores @ 2.6 GHz, 376 GiB DDR4-2933) with three `48 GB`
+`Atlas 300V Pro` cards (`Ascend 310P3`, driver `26.0.rc1`, CANN `9.1.0`) running
+`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (`Q2_0`, `--max-context 131072`, `--ple-io ram`, no MTP drafter):
 
 - **Operator parity (`ascend_parity_test` on `Ascend 310P3` vs FP32 CPU reference)**:
   - `f32 <-> f16`: `max_abs = 0.00e+00`
   - `aclnnMm FRACTAL_NZ`: `max_abs = 9.75e-04`, `rmse = 1.75e-04`
-  - `gr_norm / post_down / post_up`: `xn = 2.86e-06`, `out = 7.15e-07`
-  - `gdn_step` (verify + fold): `yg = 4.88e-04`, `state = 1.12e-08`
-  - `qsa` (prep + radix-256 select + `INT8` online attention): `xq = 1.22e-04`, `radix_2051 = EXACT`
+  - `gr_norm / post_down / post_up`: `xn = 2.86e-06`, `out = 5.96e-07`
+  - `gdn_step` (verify + fold): `yg = 2.44e-04`, `state = 1.12e-08`
+  - `qsa` (prep + `PIPE_V` radix-256 select + Flash-Block `INT8` online attention): `xq = 1.22e-04`, `radix_2051 = EXACT`
   - `moe` (`route + q2_gu + q2_down + combine`): `max_abs = 5.85e-07`, `rmse = 1.44e-07`
-- **HBM footprint (`max_context = 32768`)**:
-  - NPU 0 (layers `0..23` + PLE): `21.66 / 43.18 GiB` (`21.52 GiB` free)
-  - NPU 1 (layers `24..47` + output head): `22.81 / 43.18 GiB` (`20.37 GiB` free)
+  - `moe_int8_cube` (`T = 16, M = 160` vs FP32 `Q2_0` reference): `cos_sim = 0.999997`, `rmse = 6.57e-03`
+- **HBM & Host RAM footprint (`max_context = 131072`, `45/48` layers in `INT8 FRACTAL_NZ` Cube)**:
+  - NPU 0 (layers `0..15` + PLE, `15` INT8 Cube + `1` `Q2_0`): `42,338 / 44,213 MB` (`95.8%`)
+  - NPU 1 (layers `16..31`, `15` INT8 Cube + `1` `Q2_0`): `42,260 / 44,213 MB` (`95.6%`)
+  - NPU 2 (layers `32..47` + output head, `15` INT8 Cube + `1` `Q2_0`): `43,506 / 44,213 MB` (`98.4%`)
+  - Host DDR4 RAM: `210 / 376 GiB` active (`119 GiB` `/dev/shm` `FRACTAL_NZ` hot cache + `26.8 GiB` locked PLE table +
+    `32 GiB` conversation checkpoint budget, `0 B` swap)
 - **End-to-end serving (`serve/server.py`, warm engine)**:
-  - Model load + `FRACTAL_NZ` formatting (48 layers + `248,320` head): `71.2 s`
-  - Warm decode (`T = 1`, greedy & Philox sampled): **`4.2 tok/s`** (`~238 ms/token`)
-  - Warm prompt prefill (`34-792` tokens): **`5.1 - 6.0 tok/s`**, with multi-turn conversation checkpoint reuse
-    (`cached_tokens` restored in `< 10 ms`)
+  - Warm `/dev/shm` reload (`128.1 GB` across 3 NPUs + `128K` states): `65.2 s` (`9.1 s` dense Pass 1)
+  - Short-context decode (`T = 1`, greedy, sampled, and SSE streaming): **`8.5 - 8.9 tok/s`** (`112.8 - 117.2 ms/token`,
+    up from `4.2 tok/s` on 2-NPU `Q2_0` and `0.47 tok/s` initial bring-up)
+  - Long-context decode (`2,266 - 4,254` tokens, sparse QSA `2,051` budget): **`7.0 - 7.1 tok/s`** (`140.4 - 143.5 ms/token`)
+  - Warm prompt prefill (`93 - 4,227` tokens, `256`-token chunks): **`28.7 - 39.5 tok/s`** (up from `5.1 - 6.0 tok/s`),
+    with multi-turn checkpoint reuse (`2,265` cached tokens)

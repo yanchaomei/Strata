@@ -97,6 +97,27 @@ void launch_moe_q2_down(void* stream, const void* down_qs, const void* down_d,
 void launch_moe_combine(void* stream, const void* ye_f32, const void* plan_i32,
                         const void* ysh_f16, const void* sg_f32, void* bo_f32, uint32_t n_tok);
 
+// High-throughput INT8 FRACTAL_NZ Cube MoE pipeline (supports n_tok = 1..256, M = n_tok * 10 <= 2560):
+// 1. launch_moe_route_cube: 8-core PIPE_V router softmax + top-10 + shared expert SwiGLU + expert group cumsum/perm:
+//    moe_in_f16 [n_tok, 1808] -> ids_i32 [n_tok, 16], wts_f32 [n_tok, 16] (slots 0..9 = top_w, slot 10 = sg),
+//    sh_h_f16 [n_tok, 640], group_cumsum_i64 [512], sorted_tok_i32 [((M+7)/8)*8], tok_perm_i32 [n_tok, 16]
+void launch_moe_route_cube(void* stream, const void* moe_in_f16,
+                           void* ids_i32, void* wts_f32, void* sh_h_f16,
+                           void* group_cumsum_i64, void* sorted_tok_i32, void* tok_perm_i32,
+                           uint32_t n_tok, uint32_t n_expert);
+
+// 2. Gather xf_f16 [n_tok, 2560] -> sorted_x_f16 [M, 2560] ordered by expert 0..n_expert-1:
+void launch_moe_gather_x(void* stream, const void* xf_f16, const void* sorted_tok_i32,
+                         void* sorted_x_f16, uint32_t n_tok, uint32_t total_rows);
+
+// 3. Vectorized FP16 SwiGLU over w1 output gu_f16 [M, 1280] ([gate_640 | up_640]) -> h_f16 [M, 640]:
+void launch_moe_swiglu_f16(void* stream, const void* gu_f16, void* h_f16, uint32_t total_rows);
+
+// 4. Weighted combine of w2 output ye_f16 [M, 2560] + shared expert ysh_f16 [n_tok, 2560] -> bo_f32 [n_tok, 2560]:
+void launch_moe_combine_f16(void* stream, const void* ye_f16, const void* tok_perm_i32,
+                            const void* wts_f32, const void* ysh_f16, void* bo_f32,
+                            uint32_t n_tok, uint32_t total_rows);
+
 // Argmax over vocabulary logits_f16 [n_tok, n_vocab] -> tok_out_i32 [8] (32B aligned):
 void launch_argmax_f16(void* stream, const void* logits_f16, void* part_val_f32, void* part_idx_i32,
                        void* tok_out_i32, uint32_t n_tok, uint32_t n_vocab);
